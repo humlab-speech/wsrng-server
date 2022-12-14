@@ -8,7 +8,7 @@ import { nanoid } from "nanoid";
 import { default as mongodb } from "mongodb";
 import { default as wavFileInfo } from 'wav-file-info';
 
-const version = "0.0.0";
+const version = "1.0.0";
 const serverPort = 8080;
 
 class WebSpeechRecorderServer {
@@ -98,23 +98,42 @@ class WebSpeechRecorderServer {
 			}
 		});
 
+		this.expressApp.get("/project/:projectName/resources/images/:imageFile", async (req, res) => {
+			try {
+				let image = this.readFile("resources/"+req.params.projectName+"/images/"+req.params.imageFile, false);
+				res.end(image);
+			}
+			catch(error) {
+				res.status(404).end();
+			}
+		});
+
 		//example: /session/Y58Qu4ziiMKWjALdOviee/recfile/I0
-		this.expressApp.post("/session/:sessionId/recfile/:recfileInput", async (req, res) => {
+		this.expressApp.post("/session/:sessionId/recfile/:itemCode", async (req, res) => {
 			//this method needs to:
 			//1. store the wav provided in a file storage area
 			let audioBinary = req.body;
-			//let fileSequence = "0";
-			let fileSequence = req.params.recfileInput;
+			let fileSequence = 0; //TODO - we need to check which sequence this really is! 0 is just the first
+			
+			let itemCode = req.params.itemCode;
 			let fileEnding = "wav";
-			let filename = fileSequence+"."+fileEnding;
 			let session = await this.getSession(req.params.sessionId);
-			let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/"+req.params.sessionId;
+			let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/"+req.params.sessionId+"/"+itemCode;
 			this.mkDir(filePath);
+			let dir = fs.readdirSync(filePath);
+			dir.sort();
+			dir.forEach(d => {
+				let number = parseInt(d.split(".")[0]);
+				if(number >= fileSequence) {
+					fileSequence = number + 1;
+				}
+			});
+			let filename = fileSequence+"."+fileEnding;
+			//this.addLog("Writing "+filePath+"/"+filename, "debug");
 			fs.writeFileSync(filePath+"/"+filename, audioBinary);
 
 			let fileDuration = 0;
 			let fileInfo = await new Promise((resolve, reject) => {
-				this.addLog(filePath+"/"+filename, "debug");
 				wavFileInfo.infoByFilename(filePath+"/"+filename, (err, info) => {
 					if(err) {
 						this.addLog("Could not determine duration of wav file because: "+err.invalid_reasons.join(", "), "warn");
@@ -138,7 +157,7 @@ class WebSpeechRecorderServer {
 					"annotationTemplate" : false,
 					"text" : "" //this should be the phrase that is spoken, in text form, can be found in the script
 				  } ],
-				  "itemcode" : fileSequence, //this is the filename of the audio file without the file ending
+				  "itemcode" : itemCode,
 				  "recduration" : fileDuration, //length of the audio in milliseconds
 				  "recinstructions" : { //not sure why this is here, since it's als in the script, could perhaps be deleted?
 					"recinstructions" : ""
@@ -156,9 +175,7 @@ class WebSpeechRecorderServer {
 			this.patchObject(session, patchData);
 			await this.saveSession(session);
 			res.end();
-		});
-
-		
+		});		
 	}
 
 	async createSession(sprSessionConfig) {
