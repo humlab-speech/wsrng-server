@@ -1,0 +1,486 @@
+import { default as dotenv } from "dotenv";
+import { default as fs } from "fs";
+import { default as colors } from "colors";
+import { default as express } from "express";
+import bodyParser from "body-parser";
+import { default as http } from "http";
+import { nanoid } from "nanoid";
+import { default as mongodb } from "mongodb";
+import { default as wavFileInfo } from 'wav-file-info';
+
+const version = "0.0.0";
+const serverPort = 8080;
+
+class WebSpeechRecorderServer {
+	constructor() {
+		dotenv.config();
+		colors.enable();
+		this.addLog('Starting WebSpeechRecorderServer '+version);
+
+		this.expressApp = express();
+		this.expressApp.use(bodyParser.json({ type: "application/json" }));
+		this.expressApp.use(bodyParser.raw({ type: "audio/wav", limit: "200mb" }));
+
+		this.db = null;
+		this.connectToMongo().then(async (db) => {
+			this.db = db;
+			this.addLog("Connected to MongoDB");
+			this.mongoCreateCollections();
+			//this.purgeDatabase();
+			this.setupEndpoints();
+		}).catch(reason => {
+			this.addLog("Failed connecting to MongoDB", "error");
+		});
+		
+		this.server = this.expressApp.listen(serverPort, () => {
+			process.on('SIGTERM', () => {
+				this.addLog('SIGTERM signal received: closing WebSpeechRecorderServer')
+				this.server.close(() => {
+					this.addLog('Goodbye');
+				});
+			});
+			this.addLog(`WebSpeechRecorderServer listening on port ${serverPort}`);
+		});
+	}
+
+	setupEndpoints() {
+		this.expressApp.get("/*", (req, res, next) => {
+			this.addLog(req.method+" "+req.path);
+			next();
+		});
+		
+		this.expressApp.get("/session/:sessionId", async (req, res) => {
+			let session = await this.getSession(req.params.sessionId);
+			if(session) {
+				res.end(JSON.stringify(session, null, 2));
+			}
+			else {
+				res.status(404);
+				res.end();
+			}
+		});
+
+		this.expressApp.post("/session/new", async (req, res) => {
+			let sprSessionConfig = req.body;
+			let session = await this.createSession(sprSessionConfig);
+			res.end(JSON.stringify(session, null, 2));
+		});
+
+		this.expressApp.get("/project/:projectName", async (req, res) => {
+			let project = await this.getProject(req.params.projectName);
+			if(project) {
+				res.end(JSON.stringify(project, null, 2));
+			}
+			else {
+				res.status(404);
+				res.end();
+			}
+		});
+
+		this.expressApp.get("/script/:scriptId", async (req, res) => {
+			let script = await this.getScript(req.params.scriptId);
+			if(script) {
+				res.end(JSON.stringify(script, null, 2));
+			}
+			else {
+				res.status(404);
+				res.end();
+			}
+		});
+
+		this.expressApp.get("/project/:projectName/session/:sessionId/recfile", async (req, res) => {
+			let recfile = await this.getRecfile(req.params.projectName, req.params.sessionId);
+			if(recfile) {
+				res.end(JSON.stringify(recfile, null, 2));
+			}
+			else {
+				res.status(404).end();
+			}
+		});
+
+		//example: /session/Y58Qu4ziiMKWjALdOviee/recfile/I0
+		this.expressApp.post("/session/:sessionId/recfile/:recfileInput", async (req, res) => {
+			//this method needs to:
+			//1. store the wav provided in a file storage area
+			let audioBinary = req.body;
+			//let fileSequence = "0";
+			let fileSequence = req.params.recfileInput;
+			let fileEnding = "wav";
+			let filename = fileSequence+"."+fileEnding;
+			let session = await this.getSession(req.params.sessionId);
+			let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/"+req.params.sessionId;
+			this.mkDir(filePath);
+			fs.writeFileSync(filePath+"/"+filename, audioBinary);
+
+			let fileDuration = 0;
+			let fileInfo = await new Promise((resolve, reject) => {
+				this.addLog(filePath+"/"+filename, "debug");
+				wavFileInfo.infoByFilename(filePath+"/"+filename, (err, info) => {
+					if(err) {
+						this.addLog("Could not determine duration of wav file because: "+err.invalid_reasons.join(", "), "warn");
+						reject();
+					}
+					else {
+						fileDuration = Math.round(fileInfo.duration*1000);
+						resolve(info);
+					}
+				});
+			}).catch(error => { });
+			
+			//2. create and store a 'recfile'-type metadata object for this wav
+			let recfile = {
+				"recordingFileId": nanoid(), //this seems arbitrary
+				"project": session.project, //this is an addition to the standard wsrng-format for this object type, but we need a reference to the project as well to able to find this later
+				"session": req.params.sessionId,
+				"date" : new Date(),
+				"recording" : {
+				  "mediaitems" : [ {
+					"annotationTemplate" : false,
+					"text" : "" //this should be the phrase that is spoken, in text form, can be found in the script
+				  } ],
+				  "itemcode" : fileSequence, //this is the filename of the audio file without the file ending
+				  "recduration" : fileDuration, //length of the audio in milliseconds
+				  "recinstructions" : { //not sure why this is here, since it's als in the script, could perhaps be deleted?
+					"recinstructions" : ""
+				  }
+				}
+			}
+
+			await this.createRecfile(recfile);
+			res.end();
+		});
+
+		this.expressApp.patch("/project/:projectName/session/:sessionId", async (req, res) => {
+			let session = await this.getSession(req.params.sessionId);
+			let patchData = req.body;
+			this.patchObject(session, patchData);
+			await this.saveSession(session);
+			res.end();
+		});
+
+		
+	}
+
+	async createSession(sprSessionConfig) {
+		//Check if this project exists as an SPR-project, otherwise we need to create that first
+		let sprProjectConfig = await this.getProject(sprSessionConfig.project);
+			
+		if(!sprProjectConfig) {
+			this.addLog("Will create new SPR project");
+			sprProjectConfig = this.createProject({
+				name: sprSessionConfig.project
+			});
+		}
+		
+		let sprProjectVispId = nanoid();
+		sprProjectConfig.vispId = sprProjectVispId;
+		let sprProjectConfigJson = JSON.stringify(sprProjectConfig, null, 2);
+		
+		//We also need create a session in this project
+		let sessionId = nanoid();
+		let sessionJsonDefaults = {
+			"debugMode": true,
+			"sessionId": sessionId, //this needs to be a global id - I think!
+			"type": "NORM",
+			"project": sprProjectConfig.name,
+			"status": "CREATED",
+			"sealed": false,
+			"script": 1245
+		};
+
+		Object.keys(sessionJsonDefaults).forEach(k => {
+			if(typeof sprSessionConfig[k] == "undefined") {
+				sprSessionConfig[k] = sessionJsonDefaults[k];
+			}
+		});
+
+		await this.db.collection("sessions").insertOne(sprSessionConfig);
+
+		this.addLog("Created new SPR session", "info");
+		return sprProjectConfig;
+	}
+
+	async saveSession(session) {
+		return await this.db.collection("sessions").replaceOne({ "sessionId": session.sessionId }, session);
+	}
+
+	purgeDatabase() {
+		this.addLog("Purging database", "warn");
+		this.db.collection("projects").deleteMany({});
+		this.db.collection("recfiles").deleteMany({});
+		this.db.collection("scripts").deleteMany({});
+		this.db.collection("sessions").deleteMany({});
+	}
+
+	patchObject(original, patchData) {
+		let keys = Object.keys(patchData);
+		keys.forEach(dataKey => {
+			original[dataKey] = patchData[dataKey];
+		});
+		return original;
+	}
+
+	mkDir(dir) {
+		try {
+			fs.mkdirSync(dir, { recursive: true });
+		}
+		catch(error) {
+			this.addLog(error, "error");
+		}
+	}
+
+	getRecfileVersionsList(recfileInputDirectoryPath) {
+		try {
+			return fs.readdirSync(recfileInputDirectoryPath);
+		}
+		catch(error) {
+			this.addLog(error, "error");
+			return [];
+		}
+	}
+
+	parseCookies(request) {
+        var list = {},
+            rc = request.headers.cookie;
+
+        rc && rc.split(';').forEach(function( cookie ) {
+            var parts = cookie.split('=');
+            list[parts.shift().trim()] = decodeURI(parts.join('='));
+        });
+        return list;
+    }
+
+	async getPhpSession(request) {
+		let cookies = this.parseCookies(request);
+        let phpSessionId = cookies.PHPSESSID;
+
+        //this.addLog('Validating phpSessionId '+phpSessionId);
+
+        let options = {
+            headers: {
+                'Cookie': "PHPSESSID="+phpSessionId
+            }
+        }
+
+        return new Promise((resolve, reject) => {
+            http.get("http://apache/api/api.php?f=session", options, (incMsg) => {
+                let body = "";
+                incMsg.on('data', (data) => {
+                    body += data;
+				});
+                incMsg.on('end', () => {
+                    try {
+                        let responseBody = JSON.parse(body);
+                        if(responseBody.body == "[]") {
+                            this.addLog("User not identified");
+                            resolve({
+                                authenticated: false
+                            });
+                            return;
+                        }
+                    }
+                    catch(error) {
+                        this.addLog("Failed parsing authentication response data", "error");
+                        resolve({
+                            authenticated: false
+                        });
+                        return;
+                    }
+
+                    let userSession = JSON.parse(JSON.parse(body).body);
+                    if(typeof userSession.username == "undefined") {
+                        resolve({
+                            authenticated: false
+                        });
+                        return;
+                    }
+                    resolve({
+                        authenticated: true,
+                        userSession: userSession
+                    });
+                });
+            });
+        });
+	}
+
+	/*
+	getSessionRecfile(sessionId) {
+		let sprSession = this.getSession(sessionId);
+		this.readFile("data/project/"+sprSession.project+"/session/"+sprSession.sessionId+"/recfile.json");
+	}
+	*/
+
+	async getProject(sprProjectName) {
+		return await this.db.collection("projects").findOne({
+			"name": parseInt(sprProjectName)
+		});
+	}
+
+	async createRecfile(recFileConfig) {
+		await this.db.collection("recfiles").insertOne(recFileConfig);
+		return recFileConfig;
+	}
+
+	async createProject(projectConfig) {
+		let projectJsonDefaults = {
+			"description": "No description",
+			"name": "Noname",
+			"audioFormat" : {
+				"channels": 1
+			},
+			"speakerWindowShowStopRecordAction": true,
+			"recordingDeviceWakeLock": true
+		};
+
+		Object.keys(projectJsonDefaults).forEach(k => {
+			if(typeof projectConfig[k] == "undefined") {
+				projectConfig[k] = projectJsonDefaults[k];
+			}
+		});
+
+		await this.db.collection("projects").insertOne(projectConfig);
+		
+		return projectConfig;
+	}
+
+	//What is called a "recfile" in the wsrng is really a list of objects describing recordings, so it would be more accurate to call this function "getRecfiles", but we'll stick with the singular terminology established by wsrng
+	async getRecfile(projectName, sessionId) {
+		const sessionsCollection = this.db.collection("recfiles");
+		return await sessionsCollection.find({
+			"projectName": projectName,
+			"sessionId": sessionId
+		}).toArray();
+	}
+
+	async getSession(sessionId) {
+		const sessionsCollection = this.db.collection("sessions");
+		return await sessionsCollection.findOne({
+			sessionId: sessionId
+		});
+	}
+
+	async getScript(scriptId) {
+		const sessionsCollection = this.db.collection("scripts");
+		return await sessionsCollection.findOne({
+			"scriptId": parseInt(scriptId)
+		});
+	}
+
+	readFile(filePath, text = true) {
+		let stats = null;
+		try {
+			stats = fs.statSync(filePath);
+		}
+		catch(error) {
+			this.addLog(error, "error");
+			return null;
+		}
+
+		if(stats) {
+			let options = {}
+			if(text) {
+				options.encoding = "utf-8";
+			}
+			let buf = fs.readFileSync(filePath, options);
+			return buf;
+		}
+	}
+
+	writeFile(filePath, contents) {
+		let success = true;
+		try {
+			fs.writeFileSync(filePath, contents);
+			return true;
+		}
+		catch(error) {
+			this.addLog(error, "error");
+			return false;
+		}
+		
+	}
+
+	async connectToMongo() {
+		const mongodbUrl = 'mongodb://'+process.env.MONGO_USER+':'+process.env.MONGO_PASSWORD+'@'+process.env.MONGO_HOST+':'+process.env.MONGO_PORT;
+        this.mongoClient = new mongodb.MongoClient(mongodbUrl);
+        let db = null;
+        try {
+            await this.mongoClient.connect();
+            db = this.mongoClient.db(process.env.MONGO_DATABASE);
+			return db;
+        } catch(error) {
+			throw new Error(error);
+        }
+    }
+
+    async disconnectFromMongo() {
+        if(this.mongoClient != null) {
+            await this.mongoClient.close();
+        }
+    }
+
+	async mongoCreateCollections() {
+		let collections = await this.db.collections();
+		const sprCollectionPrefix = "";
+		const sprCollections = [sprCollectionPrefix+"projects", sprCollectionPrefix+"sessions", sprCollectionPrefix+"recfiles", sprCollectionPrefix+"scripts"];
+		collections.forEach(collection => {
+			if(sprCollections.includes(collection.collectionName)) {
+				sprCollections.splice(sprCollections.indexOf(collection.collectionName), 1);
+			}
+		});
+		sprCollections.forEach(collectionName => {
+			this.addLog("MongoDB did not contain the collection "+collectionName+", creating it now.");
+			this.db.createCollection(collectionName);
+		});
+	}
+
+	addLog(msg, level = 'info') {
+		let levelMsg = new String(level).toUpperCase();
+		if(levelMsg == "DEBUG" && this.logLevel == "INFO") {
+		  return;
+		}
+	
+		let levelMsgColor = levelMsg;
+	
+		if(levelMsg == "WARNING") { levelMsg = "WARN"; }
+	
+		switch(levelMsg) {
+		  case "INFO":
+			levelMsgColor = colors.green(levelMsg);
+		  break;
+		  case "WARN":
+			levelMsgColor = colors.yellow(levelMsg);
+		  break;
+		  case "ERROR":
+			levelMsgColor = colors.red(levelMsg);
+		  break;
+		  case "DEBUG":
+			levelMsgColor = colors.cyan(levelMsg);
+		  break;
+		}
+		
+		let logMsg = new Date().toLocaleDateString("sv-SE")+" "+new Date().toLocaleTimeString("sv-SE");
+		let printMsg = logMsg+" ["+levelMsgColor+"] "+msg;
+		let writeMsg = logMsg+" ["+levelMsg+"] "+msg+"\n";
+		
+		let logFile = "/wsrng-server/logs/wsrng-server.log";
+		switch(level) {
+		  case 'info':
+			console.log(printMsg);
+			fs.appendFileSync(logFile, writeMsg);
+			break;
+		  case 'warn':
+			console.warn(printMsg);
+			fs.appendFileSync(logFile, writeMsg);
+			break;
+		  case 'error':
+			console.error(printMsg);
+			fs.appendFileSync(logFile, writeMsg);
+			break;
+		  default:
+			console.error(printMsg);
+			fs.appendFileSync(logFile, writeMsg);
+		}
+	  }
+}
+
+new WebSpeechRecorderServer();
