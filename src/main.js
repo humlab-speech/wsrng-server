@@ -1,25 +1,32 @@
 import { default as dotenv } from "dotenv";
 import { default as fs } from "fs";
+import { default as path } from "path";
 import { default as colors } from "colors";
 import { default as express } from "express";
 import bodyParser from "body-parser";
+import cookieParser from "cookie-parser";
 import { default as http } from "http";
 import { nanoid } from "nanoid";
 import { default as mongodb } from "mongodb";
-import { default as wavFileInfo } from 'wav-file-info';
+import axios from "axios";
 
 const version = "1.0.0";
-const serverPort = 8080;
 
 class WebSpeechRecorderServer {
 	constructor() {
 		dotenv.config();
 		colors.enable();
+		this.handlerModules = [];
+		this.logFile = typeof process.env.LOG_PATH != "undefined" ? process.env.LOG_PATH : "./logs/wsrng-server.log";
 		this.addLog('Starting WebSpeechRecorderServer '+version);
+		this.serverPort = process.env.SERVER_PORT;
+
+		this.importHandlerModules();
 
 		this.expressApp = express();
 		this.expressApp.use(bodyParser.json({ type: "application/json" }));
 		this.expressApp.use(bodyParser.raw({ type: "audio/wav", limit: "200mb" }));
+		this.expressApp.use(cookieParser());
 
 		this.db = null;
 		this.connectToMongo().then(async (db) => {
@@ -32,14 +39,33 @@ class WebSpeechRecorderServer {
 			this.addLog("Failed connecting to MongoDB", "error");
 		});
 		
-		this.server = this.expressApp.listen(serverPort, () => {
+		this.server = this.expressApp.listen(this.serverPort, () => {
 			process.on('SIGTERM', () => {
 				this.addLog('SIGTERM signal received: closing WebSpeechRecorderServer')
 				this.server.close(() => {
-					this.addLog('Goodbye');
+					this.addLog('Shutdown');
 				});
 			});
-			this.addLog(`WebSpeechRecorderServer listening on port ${serverPort}`);
+			this.addLog(`WebSpeechRecorderServer listening on port ${this.serverPort}`);
+		});
+	}
+
+	importHandlerModules() {
+		//Import any handler modules
+		const handlerDir = path.join('./src', 'handler_modules');
+		fs.readdirSync(handlerDir).forEach(file => {
+			this.addLog("Importing handler module "+file)
+			import("./handler_modules/"+file).then(handler => {
+				let module = new handler.default();
+				this.handlerModules.push(module);
+				this.addLog("Handler module "+module.name+" imported");
+			});
+		});
+	}
+
+	invokeHandlerModules(eventType, data) {
+		this.handlerModules.forEach(module => {
+			module.handle(eventType, data);
 		});
 	}
 
@@ -108,16 +134,16 @@ class WebSpeechRecorderServer {
 			}
 		});
 
-		//example: /session/Y58Qu4ziiMKWjALdOviee/recfile/I0
+		//This is an upload of a recorded wav
 		this.expressApp.post("/session/:sessionId/recfile/:itemCode", async (req, res) => {
 			//this method needs to:
 			//1. store the wav provided in a file storage area
 			let audioBinary = req.body;
-			let fileSequence = 0; //TODO - we need to check which sequence this really is! 0 is just the first
-			
+			let fileSequence = 0;
 			let itemCode = req.params.itemCode;
 			let fileEnding = "wav";
 			let session = await this.getSession(req.params.sessionId);
+
 			let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/"+req.params.sessionId+"/"+itemCode;
 			this.mkDir(filePath);
 			let dir = fs.readdirSync(filePath);
@@ -129,26 +155,13 @@ class WebSpeechRecorderServer {
 				}
 			});
 			let filename = fileSequence+"."+fileEnding;
-			//this.addLog("Writing "+filePath+"/"+filename, "debug");
 			fs.writeFileSync(filePath+"/"+filename, audioBinary);
 
-			let fileDuration = 0;
-			let fileInfo = await new Promise((resolve, reject) => {
-				wavFileInfo.infoByFilename(filePath+"/"+filename, (err, info) => {
-					if(err) {
-						this.addLog("Could not determine duration of wav file because: "+err.invalid_reasons.join(", "), "warn");
-						reject();
-					}
-					else {
-						fileDuration = Math.round(fileInfo.duration*1000);
-						resolve(info);
-					}
-				});
-			}).catch(error => { });
+			let fileDuration = 0; //FIXME: This is always zero, need to find a wav lib which can give us a duration, wav-file-info does not work.
 			
 			//2. create and store a 'recfile'-type metadata object for this wav
 			let recfile = {
-				"recordingFileId": nanoid(), //this seems arbitrary
+				"recordingFileId": fileSequence, //should be the same as the filename without the extension
 				"project": session.project, //this is an addition to the standard wsrng-format for this object type, but we need a reference to the project as well to able to find this later
 				"session": req.params.sessionId,
 				"date" : new Date(),
@@ -159,23 +172,46 @@ class WebSpeechRecorderServer {
 				  } ],
 				  "itemcode" : itemCode,
 				  "recduration" : fileDuration, //length of the audio in milliseconds
-				  "recinstructions" : { //not sure why this is here, since it's als in the script, could perhaps be deleted?
+				  "recinstructions" : { //not sure why this is here, since it's also in the script, could perhaps be deleted?
 					"recinstructions" : ""
 				  }
 				}
 			}
 
 			await this.createRecfile(recfile);
+
+			this.invokeHandlerModules("sessionFileUpload", {
+				audioBinary: audioBinary,
+				itemCode: itemCode,
+				fileEnding: fileEnding,
+				session: session
+			});
+
 			res.end();
 		});
 
 		this.expressApp.patch("/project/:projectName/session/:sessionId", async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
 			let patchData = req.body;
+
+			if(typeof patchData.status != "undefined" && patchData.status == "COMPLETED") {
+				this.invokeHandlerModules("sessionComplete", {
+					projectName: req.params.projectName,
+					session: session,
+					patchData: patchData
+				});
+			}
+
 			this.patchObject(session, patchData);
 			await this.saveSession(session);
+
+			this.invokeHandlerModules("sessionPatched", {
+				session: session,
+				patchData: patchData
+			});
+
 			res.end();
-		});		
+		});
 	}
 
 	async createSession(sprSessionConfig) {
@@ -214,6 +250,11 @@ class WebSpeechRecorderServer {
 		await this.db.collection("sessions").insertOne(sprSessionConfig);
 
 		this.addLog("Created new SPR session", "info");
+
+		this.invokeHandlerModules("sessionCreated", {
+			session: sprSessionConfig
+		});
+
 		return sprProjectConfig;
 	}
 
@@ -267,74 +308,31 @@ class WebSpeechRecorderServer {
         return list;
     }
 
-	async getPhpSession(request) {
-		let cookies = this.parseCookies(request);
-        let phpSessionId = cookies.PHPSESSID;
-
-        //this.addLog('Validating phpSessionId '+phpSessionId);
-
-        let options = {
-            headers: {
-                'Cookie': "PHPSESSID="+phpSessionId
-            }
-        }
-
-        return new Promise((resolve, reject) => {
-            http.get("http://apache/api/api.php?f=session", options, (incMsg) => {
-                let body = "";
-                incMsg.on('data', (data) => {
-                    body += data;
-				});
-                incMsg.on('end', () => {
-                    try {
-                        let responseBody = JSON.parse(body);
-                        if(responseBody.body == "[]") {
-                            this.addLog("User not identified");
-                            resolve({
-                                authenticated: false
-                            });
-                            return;
-                        }
-                    }
-                    catch(error) {
-                        this.addLog("Failed parsing authentication response data", "error");
-                        resolve({
-                            authenticated: false
-                        });
-                        return;
-                    }
-
-                    let userSession = JSON.parse(JSON.parse(body).body);
-                    if(typeof userSession.username == "undefined") {
-                        resolve({
-                            authenticated: false
-                        });
-                        return;
-                    }
-                    resolve({
-                        authenticated: true,
-                        userSession: userSession
-                    });
-                });
-            });
-        });
-	}
-
-	/*
-	getSessionRecfile(sessionId) {
-		let sprSession = this.getSession(sessionId);
-		this.readFile("data/project/"+sprSession.project+"/session/"+sprSession.sessionId+"/recfile.json");
-	}
-	*/
-
 	async getProject(sprProjectName) {
-		return await this.db.collection("projects").findOne({
+		let project = await this.db.collection("projects").findOne({
 			"name": parseInt(sprProjectName)
 		});
+
+		if(!project) {
+			project = {
+				name: sprProjectName,
+				description: 'No description',
+				audioFormat: {
+					channels: 1
+				},
+				speakerWindowShowStopRecordAction: true,
+				recordingDeviceWakeLock: true
+			};
+
+			await this.db.collection("projects").insertOne(project)
+		}
+
+		return project;
 	}
 
 	async createRecfile(recFileConfig) {
 		await this.db.collection("recfiles").insertOne(recFileConfig);
+		this.invokeHandlerModules("createRecfile", recFileConfig);
 		return recFileConfig;
 	}
 
@@ -356,11 +354,13 @@ class WebSpeechRecorderServer {
 		});
 
 		await this.db.collection("projects").insertOne(projectConfig);
+
+		this.invokeHandlerModules("createProject", projectConfig);
 		
 		return projectConfig;
 	}
 
-	//What is called a "recfile" in the wsrng is really a list of objects describing recordings, so it would be more accurate to call this function "getRecfiles", but we'll stick with the singular terminology established by wsrng
+	//What is called a "recfile" in the wsrng is really a list of objects describing recordings
 	async getRecfile(projectName, sessionId) {
 		const sessionsCollection = this.db.collection("recfiles");
 		return await sessionsCollection.find({
@@ -413,7 +413,6 @@ class WebSpeechRecorderServer {
 			this.addLog(error, "error");
 			return false;
 		}
-		
 	}
 
 	async connectToMongo() {
@@ -478,24 +477,23 @@ class WebSpeechRecorderServer {
 		let logMsg = new Date().toLocaleDateString("sv-SE")+" "+new Date().toLocaleTimeString("sv-SE");
 		let printMsg = logMsg+" ["+levelMsgColor+"] "+msg;
 		let writeMsg = logMsg+" ["+levelMsg+"] "+msg+"\n";
-		
-		let logFile = "/wsrng-server/logs/wsrng-server.log";
+
 		switch(level) {
 		  case 'info':
 			console.log(printMsg);
-			fs.appendFileSync(logFile, writeMsg);
+			fs.appendFileSync(this.logFile, writeMsg);
 			break;
 		  case 'warn':
 			console.warn(printMsg);
-			fs.appendFileSync(logFile, writeMsg);
+			fs.appendFileSync(this.logFile, writeMsg);
 			break;
 		  case 'error':
 			console.error(printMsg);
-			fs.appendFileSync(logFile, writeMsg);
+			fs.appendFileSync(this.logFile, writeMsg);
 			break;
 		  default:
 			console.error(printMsg);
-			fs.appendFileSync(logFile, writeMsg);
+			fs.appendFileSync(this.logFile, writeMsg);
 		}
 	  }
 }
