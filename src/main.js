@@ -18,6 +18,7 @@ class WebSpeechRecorderServer {
 		colors.enable();
 		this.handlerModules = [];
 		this.logFile = typeof process.env.LOG_PATH != "undefined" ? process.env.LOG_PATH : "./logs/wsrng-server.log";
+		this.enbledModules = typeof process.env.ENABLED_MODULES != "undefined" ? JSON.parse(process.env.ENABLED_MODULES) : [];
 		this.addLog('Starting WebSpeechRecorderServer '+version);
 		this.serverPort = process.env.SERVER_PORT;
 
@@ -54,12 +55,16 @@ class WebSpeechRecorderServer {
 		//Import any handler modules
 		const handlerDir = path.join('./src', 'handler_modules');
 		fs.readdirSync(handlerDir).forEach(file => {
-			this.addLog("Importing handler module "+file)
-			import("./handler_modules/"+file).then(handler => {
-				let module = new handler.default();
-				this.handlerModules.push(module);
-				this.addLog("Handler module "+module.name+" imported");
-			});
+			let moduleName = file.split(".")[0];
+			if(this.enbledModules.includes(moduleName)) {
+				this.addLog("Importing handler module "+file)
+				import("./handler_modules/"+file).then(handler => {
+					let module = new handler.default();
+					this.handlerModules.push(module);
+					this.addLog("Handler module "+module.name+" imported");
+				});
+			}
+			
 		});
 	}
 

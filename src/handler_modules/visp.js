@@ -1,11 +1,14 @@
+/**
+ * This is the handler module which provides the neccessary functionality for the visp system.
+ * It provides GitLab integration by pushing all the recorded/uploaded audio directly to GitLab.
+ * As well as notifies the visp backend of the session completion.
+ */
 class VispHandler {
     constructor() {
         this.name = 'Visp';
     }
     
     handle(eventType, data = null) {
-        console.log(eventType, data);
-
         switch(eventType) {
             case "sessionComplete":
                 this.importSessionAudioFiles(data);
