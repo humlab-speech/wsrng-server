@@ -3,8 +3,12 @@
  * It provides GitLab integration by pushing all the recorded/uploaded audio directly to GitLab.
  * As well as notifies the visp backend of the session completion.
  */
+
+import axios from "axios";
+
 class VispHandler {
-    constructor() {
+    constructor(app) {
+        this.app = app;
         this.name = 'Visp';
     }
     
@@ -21,8 +25,25 @@ class VispHandler {
 
     importSessionAudioFiles(data) {
         //this recording session is now complete, which means we need to import the audio files into the project
-        this.addLog("Session is now complete, tell the session-manager to import audio files", "debug");
-        axios.post("http://session-manager/importaudiofiles", { projectId: data.projectName, sessionId: data.session.sessionId }).then(response => {
+        this.app.addLog("Session is now complete, tell the session-manager to import audio files", "debug");
+
+        //This is not working properly, the session-manager is not receiving the request
+
+        let postData = {
+            projectId: data.projectName,
+            sessionId: data.session.sessionId
+        };
+
+        //urlencode data
+        let formBody = [];
+        for (let property in postData) {
+            let encodedKey = encodeURIComponent(property);
+            let encodedValue = encodeURIComponent(postData[property]);
+            formBody.push(encodedKey + "=" + encodedValue);
+        }
+        formBody = formBody.join("&");
+        
+        axios.post("http://session-manager:8080/api/importaudiofiles", formBody).then(response => {
             console.log(response);
         });
     }
@@ -39,7 +60,7 @@ class VispHandler {
         let actionType = "create";
         commitActions.push({
             "action": actionType,
-            "file_path": "Data/unimported_audio/"+data.session.sessionId+"/"+data.itemCode+"."+data.fileEnding,
+            "file_path": "Data/unimported_audio/emudb-sessions/"+data.session.sessionId+"/"+data.itemCode+"."+data.fileEnding,
             "content": data.audioBinary.toString("base64"),
             "encoding": "base64"
         });
@@ -52,28 +73,70 @@ class VispHandler {
             'PRIVATE-TOKEN': process.env.GIT_API_ACCESS_TOKEN
         };
         
+        this.gitlabCommit(data);
+        /*
         axios.post(requestUrl, postData, { headers: headers }).then(commitRes => {
-            this.addLog("Successfully commited recfile (new) to Gitlab", "info");
+            this.app.addLog("Successfully commited recfile (new) to Gitlab", "info");
             //this.addLog("Gitlab commit success: "+JSON.stringify(commitRes, null, 2), "debug");
         }).catch(error => {
             //this.addLog("Gitlab commit error: "+JSON.stringify(error, null, 2), "error");
-            this.addLog("File already exists, trying to update", "debug");
+            this.app.addLog("File already exists, trying to update", "debug");
                 actionType = "update";
                 commitActions[0].action = actionType;
                 axios.post(requestUrl, postData, { headers: headers }).then(commitRes => {
                     //this.addLog("Gitlab commit success: "+JSON.stringify(commitRes, null, 2), "debug");
-                    this.addLog("Successfully commited recfile (updated) to Gitlab", "info");
+                    this.app.addLog("Successfully commited recfile (updated) to Gitlab", "info");
                 }).catch(error => {
-                    this.addLog("Gitlab commit error: "+JSON.stringify(error, null, 2), "error");
+                    this.app.addLog("Gitlab commit error: "+JSON.stringify(error, null, 2), "error");
                 });
         });
+        */
+    }
+
+    async gitlabCommit(data, actionType = "create") {
+        let commitActions = [];
+        let commitData = {
+            "branch": "master",
+            "commit_message": "recfile from webspeechrecorder",
+            "actions": commitActions
+        }
+
+        commitActions.push({
+            "action": actionType,
+            "file_path": "Data/unimported_audio/emudb-sessions/"+data.session.sessionId+"/"+data.itemCode+"."+data.fileEnding,
+            "content": data.audioBinary.toString("base64"),
+            "encoding": "base64"
+        });
+        let requestUrl = "http://gitlab/api/v4/projects/"+data.session.project+"/repository/commits";
+        let postData = commitData;
+        let headers = {
+            'Content-Type': 'application/json',
+            'PRIVATE-TOKEN': process.env.GIT_API_ACCESS_TOKEN
+        };
+        try {
+            this.app.addLog("Trying to create file in Gitlab", "info");
+            let res = await axios.post(requestUrl, postData, { headers: headers });
+            if(res.status == 201) {
+                //all is well
+            }
+        }
+        catch(error) {
+            if(error.response.status == 400) {
+                //try again but do an update this time
+                this.app.addLog("File already exists, trying to update", "info");
+                await this.gitlabCommit(data, "update");
+            }
+            else {
+                this.app.addLog("Gitlab commit error: "+JSON.stringify(error, null, 2), "error");
+            }
+        }
     }
 
     async getPhpSession(request) {
 		let cookies = this.parseCookies(request);
         let phpSessionId = cookies.PHPSESSID;
 
-        //this.addLog('Validating phpSessionId '+phpSessionId);
+        //this.app.addLog('Validating phpSessionId '+phpSessionId);
 
         let options = {
             headers: {
@@ -91,7 +154,7 @@ class VispHandler {
                     try {
                         let responseBody = JSON.parse(body);
                         if(responseBody.body == "[]") {
-                            this.addLog("User not identified");
+                            this.app.addLog("User not identified");
                             resolve({
                                 authenticated: false
                             });
@@ -99,7 +162,7 @@ class VispHandler {
                         }
                     }
                     catch(error) {
-                        this.addLog("Failed parsing authentication response data", "error");
+                        this.app.addLog("Failed parsing authentication response data", "error");
                         resolve({
                             authenticated: false
                         });

@@ -8,7 +8,6 @@ import cookieParser from "cookie-parser";
 import { default as http } from "http";
 import { nanoid } from "nanoid";
 import { default as mongodb } from "mongodb";
-import axios from "axios";
 
 const version = "1.0.0";
 
@@ -57,14 +56,12 @@ class WebSpeechRecorderServer {
 		fs.readdirSync(handlerDir).forEach(file => {
 			let moduleName = file.split(".")[0];
 			if(this.enbledModules.includes(moduleName)) {
-				this.addLog("Importing handler module "+file)
 				import("./handler_modules/"+file).then(handler => {
-					let module = new handler.default();
+					let module = new handler.default(this);
 					this.handlerModules.push(module);
 					this.addLog("Handler module "+module.name+" imported");
 				});
 			}
-			
 		});
 	}
 
@@ -82,6 +79,15 @@ class WebSpeechRecorderServer {
 		
 		this.expressApp.get("/session/:sessionId", async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
+
+			//if this is a completed session, set it to loaded here instead
+			//this is because if we tell the spr client that this session is already completed,
+			//it will not send the COMPLETED status patch request when the session is completed
+			//and thus we will not know when recording have finished
+			if(session.status == "COMPLETED") {
+				session.status = "LOADED";
+			}
+
 			if(session) {
 				res.end(JSON.stringify(session, null, 2));
 			}
@@ -198,6 +204,23 @@ class WebSpeechRecorderServer {
 		this.expressApp.patch("/project/:projectName/session/:sessionId", async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
 			let patchData = req.body;
+
+			//status can be:
+			//CREATED
+			//LOADED
+			//STARTED
+			//COMPLETED
+
+			if(typeof patchData.restartedDate != "undefined" && patchData.restartedDate != "") {
+				//this is a restart of an already completed session
+				this.invokeHandlerModules("sessionRestarted", {
+					projectName: req.params.projectName,
+					session: session,
+					patchData: patchData
+				});
+
+				session.status = "LOADED";
+			}
 
 			if(typeof patchData.status != "undefined" && patchData.status == "COMPLETED") {
 				this.invokeHandlerModules("sessionComplete", {
@@ -384,7 +407,7 @@ class WebSpeechRecorderServer {
 	async getScript(scriptId) {
 		const sessionsCollection = this.db.collection("scripts");
 		return await sessionsCollection.findOne({
-			"scriptId": parseInt(scriptId)
+			"scriptId": scriptId
 		});
 	}
 
