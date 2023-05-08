@@ -74,23 +74,6 @@ class VispHandler {
         };
         
         this.gitlabCommit(data);
-        /*
-        axios.post(requestUrl, postData, { headers: headers }).then(commitRes => {
-            this.app.addLog("Successfully commited recfile (new) to Gitlab", "info");
-            //this.addLog("Gitlab commit success: "+JSON.stringify(commitRes, null, 2), "debug");
-        }).catch(error => {
-            //this.addLog("Gitlab commit error: "+JSON.stringify(error, null, 2), "error");
-            this.app.addLog("File already exists, trying to update", "debug");
-                actionType = "update";
-                commitActions[0].action = actionType;
-                axios.post(requestUrl, postData, { headers: headers }).then(commitRes => {
-                    //this.addLog("Gitlab commit success: "+JSON.stringify(commitRes, null, 2), "debug");
-                    this.app.addLog("Successfully commited recfile (updated) to Gitlab", "info");
-                }).catch(error => {
-                    this.app.addLog("Gitlab commit error: "+JSON.stringify(error, null, 2), "error");
-                });
-        });
-        */
     }
 
     async gitlabCommit(data, actionType = "create") {
