@@ -80,6 +80,12 @@ class WebSpeechRecorderServer {
 		this.expressApp.get("/session/:sessionId", async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
 
+			if(!session) {
+				res.status(404);
+				res.end("Session '"+req.params.sessionId+"' not found");
+				return;
+			}
+
 			//if this is a completed session, set it to loaded here instead
 			//this is because if we tell the spr client that this session is already completed,
 			//it will not send the COMPLETED status patch request when the session is completed
