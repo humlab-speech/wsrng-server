@@ -161,7 +161,8 @@ class WebSpeechRecorderServer {
 			let fileEnding = "wav";
 			let session = await this.getSession(req.params.sessionId);
 
-			let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/"+req.params.sessionId+"/"+itemCode;
+			let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/Data/speech_recorder_uploads/emudb-sessions/"+req.params.sessionId+"/"+itemCode;
+			//let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/Data/unimported_audio/emudb-sessions/"+req.params.sessionId+"/"+itemCode;
 			this.mkDir(filePath);
 			let dir = fs.readdirSync(filePath);
 			dir.sort();
@@ -201,7 +202,9 @@ class WebSpeechRecorderServer {
 				audioBinary: audioBinary,
 				itemCode: itemCode,
 				fileEnding: fileEnding,
-				session: session
+				session: session,
+				filePath: filePath,
+				recfile: recfile
 			});
 
 			res.end();
