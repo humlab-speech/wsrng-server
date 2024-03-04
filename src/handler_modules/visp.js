@@ -64,7 +64,7 @@ visp-wsrng-server-1  | }
         formBody = formBody.join("&");
 
         axios.post("http://session-manager:8080/api/importaudiofiles", formBody).then(response => {
-            console.log(response);
+            console.log(response.status, response.statusText, response.data);
         }).catch(error => {
             console.log(error);
         });
