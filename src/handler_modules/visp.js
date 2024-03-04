@@ -66,13 +66,13 @@ visp-wsrng-server-1  | }
         axios.post("http://session-manager:8080/api/importaudiofiles", formBody).then(response => {
             console.log(response.status, response.statusText, response.data);
         }).catch(error => {
-            console.log(error.status, error.statusText, error.data);
+            console.log(error.code, error.request.data);
         });
 
     }
 
     sessionFileUpload(data) {
-        console.log("sessionFileUpload");
+        this.app.addLog("Session file upload (unimplemented)", "info");
         /*
         data = {
 visp-wsrng-server-1  |   audioBinary: <Buffer 52 49 46 46 28 c0 02 00 57 41 56 45 66 6d 74 20 10 00 00 00 01 00 01 00 80 bb 00 00 00 77 01 00 02 00 10 00 64 61 74 61 00 c0 02 00 00 00 00 00 00 00 ... 181198 more bytes>,
