@@ -66,13 +66,17 @@ class WebSpeechRecorderServer {
 	}
 
 	invokeHandlerModules(eventType, data) {
+		if(this.handlerModules.length == 0) {
+			this.addLog("Fired event "+eventType+" but no handler modules loaded", "warn");
+			return;
+		}
 		this.handlerModules.forEach(module => {
 			module.handle(eventType, data);
 		});
 	}
 
 	setupEndpoints() {
-		this.expressApp.get("/*", (req, res, next) => {
+		this.expressApp.use((req, res, next) => {
 			this.addLog(req.method+" "+req.path);
 			next();
 		});
@@ -237,6 +241,8 @@ class WebSpeechRecorderServer {
 					session: session,
 					patchData: patchData
 				});
+
+				session.sealed = true; //sealing the session when completed to prevent further changes
 			}
 
 			this.patchObject(session, patchData);
@@ -278,6 +284,7 @@ class WebSpeechRecorderServer {
 			"script": 1245
 		};
 
+		//Merge the defaults with the provided config
 		Object.keys(sessionJsonDefaults).forEach(k => {
 			if(typeof sprSessionConfig[k] == "undefined") {
 				sprSessionConfig[k] = sessionJsonDefaults[k];
