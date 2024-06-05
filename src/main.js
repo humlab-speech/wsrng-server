@@ -9,7 +9,7 @@ import { default as http } from "http";
 import { nanoid } from "nanoid";
 import { default as mongodb } from "mongodb";
 
-const version = "1.0.0";
+const version = "1.0.1";
 
 class WebSpeechRecorderServer {
 	constructor() {
