@@ -58,7 +58,7 @@ class VispHandler {
             //create all the directories in the destination path
             let destinationPathParts = destinationPath.split("/");
             let currentPath = "";
-            console.log("Creating destination path directories");
+            this.app.addLog("Creating destination path directories", "debug");
             for(let i = 0; i < destinationPathParts.length - 1; i++) {
                 currentPath += destinationPathParts[i]+"/";
                 if (!fs.existsSync(currentPath)){
@@ -66,7 +66,7 @@ class VispHandler {
                 }
             }
 
-            console.log("Moving file from "+sourceFilePath+" to "+destinationPath);
+            this.app.addLog("Moving file from "+sourceFilePath+" to "+destinationPath, "debug");
 
             //we do not use fs.renameSync because it does not work across different filesystems
             try {
@@ -81,9 +81,9 @@ class VispHandler {
                 console.error(`Error moving file:`, error);
             }
 
-            console.log('File moved successfully!');
+            this.app.addLog("File moved successfully", "debug");
         } catch (err) {
-            console.error('Error moving file:', err);
+            this.app.addLog("Error moving file: "+err, "error");
         }
     }
 
