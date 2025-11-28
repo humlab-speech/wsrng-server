@@ -28,8 +28,10 @@ COPY --from=dependencies /app/node_modules ./node_modules
 COPY package*.json ./
 COPY src ./src
 
-# Create logs directory
-RUN mkdir -p logs && touch logs/wsrng-server.log
+# Create logs directory with correct ownership
+RUN mkdir -p logs && \
+    touch logs/wsrng-server.log && \
+    chown -R node:node /wsrng-server
 
 # Run as node user for security
 USER node
