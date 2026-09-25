@@ -7,19 +7,33 @@
 import axios from "axios";
 import { default as fs } from "fs";
 
+// Fallback delay after a session is marked COMPLETED. Normally the import is
+// triggered the instant the last expected file lands (see the completion
+// barrier below); this timer is only a safety net for sessions completed with
+// fewer recordings than prompts (e.g. a skipped prompt), so the import never
+// hangs waiting for a file that will never arrive.
+const IMPORT_FALLBACK_MS = 10000;
+
 class VispHandler {
     constructor(app) {
         this.app = app;
         this.name = 'Visp';
+        // Per-session completion barriers, keyed by sessionId. Lets us import the
+        // moment the final expected file has been moved into place instead of
+        // racing the SPR client, which sends COMPLETED before its last upload.
+        this.pendingImports = new Map();
     }
-    
+
     handle(eventType, data = null) {
         switch(eventType) {
             case "sessionComplete":
-                this.importSessionAudioFiles(data);
+                this.onSessionComplete(data);
                 break;
             case "sessionFileUpload":
                 this.sessionFileUpload(data);
+                // A file just landed; if its session is awaiting import, this may
+                // be the last one we were waiting for.
+                this.maybeImport(data.session);
                 break;
         }
     }
@@ -87,13 +101,110 @@ class VispHandler {
         }
     }
 
-    importSessionAudioFiles(data) {
-        //this recording session is now complete, which means we need to import the audio files into the project
+    async onSessionComplete(data) {
+        const session = data.session;
+        const sessionId = session.sessionId;
+
+        // The SPR client sends the COMPLETED status before its final file finishes
+        // uploading, so we cannot import right here. Instead we register a barrier:
+        // import as soon as every expected file has arrived (checked here and on
+        // each subsequent sessionFileUpload), with a short fallback in case some
+        // prompts were never recorded.
+        const entry = {
+            expected: null,
+            triggered: false,
+            fallbackTimer: null,
+            projectId: session.project,
+            sessionId: sessionId,
+        };
+        this.pendingImports.set(sessionId, entry);
+
+        // Arm the fallback first, so a failure to read the script (expected stays
+        // null) still results in an import.
+        entry.fallbackTimer = setTimeout(() => {
+            this.app.addLog("Import barrier fallback fired for session " + sessionId + " (expected count not reached in time)", "warn");
+            this.triggerImport(entry);
+        }, IMPORT_FALLBACK_MS);
+
+        entry.expected = await this.countExpectedPrompts(session);
+        this.app.addLog("Session " + sessionId + " complete; expecting " + entry.expected + " recording(s) before import", "debug");
+
+        // Files may have arrived while we were reading the script.
+        this.maybeImport(session);
+    }
+
+    // Number of prompts defined in this session's script. Walks the SPR script
+    // structure: sections[].groups[].promptItems[]. Returns 0 if it can't be
+    // determined, which defers to the fallback timer rather than importing early.
+    async countExpectedPrompts(session) {
+        try {
+            const script = await this.app.getScript(session.script);
+            if(!script || !Array.isArray(script.sections)) {
+                return 0;
+            }
+            let count = 0;
+            script.sections.forEach(section => {
+                (section.groups || []).forEach(group => {
+                    count += (group.promptItems || []).length;
+                });
+            });
+            return count;
+        } catch(error) {
+            this.app.addLog("Could not read script for session " + session.sessionId + ": " + error, "error");
+            return 0;
+        }
+    }
+
+    // Number of distinct prompts uploaded so far for this session. We count the
+    // moved files in the repository destination dir, where sessionFileUpload keeps
+    // exactly one <itemcode>.wav per prompt (latest version only), so re-recording
+    // a prompt never inflates this count.
+    countUploadedFiles(session) {
+        const destDir = "/repositories/" + session.project + "/Data/speech_recorder_uploads/emudb-sessions/" + session.sessionId;
+        try {
+            if(!fs.existsSync(destDir)) {
+                return 0;
+            }
+            return fs.readdirSync(destDir).filter(f => f !== "." && f !== "..").length;
+        } catch(error) {
+            this.app.addLog("Could not count uploaded files for session " + session.sessionId + ": " + error, "error");
+            return 0;
+        }
+    }
+
+    // Trigger the import if every expected file is now present. No-op if there is
+    // no barrier for this session, it already fired, or files are still missing.
+    maybeImport(session) {
+        if(!session || !session.sessionId) {
+            return;
+        }
+        const entry = this.pendingImports.get(session.sessionId);
+        if(!entry || entry.triggered) {
+            return;
+        }
+        if(entry.expected > 0 && this.countUploadedFiles(session) >= entry.expected) {
+            this.triggerImport(entry);
+        }
+    }
+
+    // Tell the session-manager to import this session's audio. Single-fire: clears
+    // the barrier so neither a late upload nor the fallback timer can re-trigger.
+    triggerImport(entry) {
+        if(entry.triggered) {
+            return;
+        }
+        entry.triggered = true;
+        if(entry.fallbackTimer) {
+            clearTimeout(entry.fallbackTimer);
+            entry.fallbackTimer = null;
+        }
+        this.pendingImports.delete(entry.sessionId);
+
         this.app.addLog("Session is now complete, tell the session-manager to import audio files", "debug");
 
         let postData = {
-            projectId: data.projectName,
-            sessionId: data.session.sessionId
+            projectId: entry.projectId,
+            sessionId: entry.sessionId
         };
 
         axios.post("http://session-manager:8080/api/importaudiofiles", postData, {
