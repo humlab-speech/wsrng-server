@@ -7,79 +7,72 @@
 import axios from "axios";
 import { default as fs } from "fs";
 
+// How often, and how far apart, to retry telling the session-manager that a
+// session needs an import check. The hint only speeds things up: the
+// session-manager also polls upload directories and imports anything that
+// hasn't been imported yet, so a hint that never arrives just means a later import.
+const IMPORT_HINT_RETRY_DELAYS_MS = [2000, 10000, 30000];
+
 class VispHandler {
     constructor(app) {
         this.app = app;
         this.name = 'Visp';
     }
-    
+
     handle(eventType, data = null) {
         switch(eventType) {
             case "sessionComplete":
-                this.importSessionAudioFiles(data);
+                this.requestImportCheck(data.session);
                 break;
             case "sessionFileUpload":
                 this.sessionFileUpload(data);
+                // A re-take after completion (or the final upload, which the SPR
+                // client sends after COMPLETED) changes what should be imported.
+                if(data.session.sealed) {
+                    this.requestImportCheck(data.session);
+                }
                 break;
         }
+    }
+
+    // Where sessionFileUpload keeps the latest take of each prompt.
+    sessionUploadDir(session) {
+        return "/repositories/"+session.project+"/Data/speech_recorder_uploads/emudb-sessions/"+session.sessionId;
+    }
+
+    resolveRecfilePath(session, itemCode) {
+        const filePath = this.sessionUploadDir(session)+"/"+itemCode+".wav";
+        return fs.existsSync(filePath) ? filePath : null;
     }
 
     sessionFileUpload(data) {
         this.app.addLog("Session file upload", "info");
 
-        let projectId = data.session.project;
-        let sessionId = data.session.sessionId;
+        let destinationFolder = this.sessionUploadDir(data.session);
+        let destinationPath = destinationFolder+"/"+data.itemCode+"."+data.fileEnding;
 
-        let sourceDirectory = data.filePath;
-        let destinationPath = "/repositories/"+projectId+"/Data/speech_recorder_uploads/emudb-sessions/"+sessionId+"/"+data.itemCode+"."+data.fileEnding;
-        
         try {
-            //move the latest file to the destination
-            //the files will be named: 0.wav, 1.wav, 2.wav, etc.
+            fs.mkdirSync(destinationFolder, { recursive: true });
 
-            //check if the destination folder exists
-            let destinationFolder = destinationPath.substring(0, destinationPath.lastIndexOf("/"));
-            if (!fs.existsSync(destinationFolder)){
-                fs.mkdirSync(destinationFolder, { recursive: true });
-            }
-
-            //scan data.filePath for the latest file
+            //the upload endpoint numbers takes 0.wav, 1.wav, ...; move the newest one
             let latestFile = 0;
-            let files = fs.readdirSync(sourceDirectory);
-            files.forEach(file => {
+            fs.readdirSync(data.filePath).forEach(file => {
                 let fileNumber = parseInt(file.substring(0, file.lastIndexOf(".")));
                 if(fileNumber > latestFile) {
                     latestFile = fileNumber;
                 }
             });
-
-            let sourceFilePath = sourceDirectory+"/"+latestFile+"."+data.fileEnding;
-
-            //create all the directories in the destination path
-            let destinationPathParts = destinationPath.split("/");
-            let currentPath = "";
-            this.app.addLog("Creating destination path directories", "debug");
-            for(let i = 0; i < destinationPathParts.length - 1; i++) {
-                currentPath += destinationPathParts[i]+"/";
-                if (!fs.existsSync(currentPath)){
-                    fs.mkdirSync(currentPath);
-                }
-            }
+            let sourceFilePath = data.filePath+"/"+latestFile+"."+data.fileEnding;
 
             this.app.addLog("Moving file from "+sourceFilePath+" to "+destinationPath, "debug");
 
-            //we do not use fs.renameSync because it does not work across different filesystems
-            try {
-                // Copy the file
-                fs.copyFileSync(sourceFilePath, destinationPath);
-                //console.log(`File copied to ${destinationPath}`);
-                
-                // Delete the original file
-                fs.unlinkSync(sourceFilePath);
-                //console.log(`Original file deleted at ${sourceFilePath}`);
-            } catch (error) {
-                console.error(`Error moving file:`, error);
-            }
+            //Copy to a temp name and rename into place, so the session-manager's
+            //import never picks up a half-written file. (A plain rename would not
+            //work: the source is on a different filesystem.)
+            let tempPath = destinationFolder+"/."+data.itemCode+"."+data.fileEnding+".tmp";
+            fs.copyFileSync(sourceFilePath, tempPath);
+            fs.renameSync(tempPath, destinationPath);
+            fs.unlinkSync(sourceFilePath);
 
             this.app.addLog("File moved successfully", "debug");
         } catch (err) {
@@ -87,37 +80,30 @@ class VispHandler {
         }
     }
 
-    importSessionAudioFiles(data) {
-        //this recording session is now complete, which means we need to import the audio files into the project
-        this.app.addLog("Session is now complete, tell the session-manager to import audio files", "debug");
-
-        let postData = {
-            projectId: data.projectName,
-            sessionId: data.session.sessionId
+    // Tell the session-manager to check this session for audio that needs
+    // importing. It decides when the uploads have settled, so this can be sent
+    // before the final file lands.
+    async requestImportCheck(session, attempt = 0) {
+        const postData = {
+            projectId: session.project,
+            sessionId: session.sessionId
         };
-
-        axios.post("http://session-manager:8080/api/importaudiofiles", postData, {
-            headers: {
-                'Content-Type': 'application/json'
+        try {
+            await axios.post("http://session-manager:8080/api/importaudiofiles", postData, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 10000
+            });
+            this.app.addLog("Requested import check for session "+session.sessionId, "debug");
+        } catch(error) {
+            const reason = error.response ? "HTTP "+error.response.status : error.message;
+            if(attempt < IMPORT_HINT_RETRY_DELAYS_MS.length) {
+                this.app.addLog("Import check request for session "+session.sessionId+" failed ("+reason+"), retrying", "warn");
+                setTimeout(() => this.requestImportCheck(session, attempt + 1), IMPORT_HINT_RETRY_DELAYS_MS[attempt]);
             }
-        }).then(response => {
-            console.log(response.status, response.statusText, response.data);
-        }).catch(error => {
-            if (error.response) {
-                // The request was made and the server responded with a status code
-                // that falls out of the range of 2xx
-                console.log(error.response.status, error.response.statusText, error.response.data);
-            } else if (error.request) {
-                // The request was made but no response was received
-                // `error.request` is an instance of XMLHttpRequest in the browser and an instance of
-                // http.ClientRequest in node.js
-                console.log('No response received:', error.request);
-            } else {
-                // Something happened in setting up the request that triggered an Error
-                console.log('Error', error.message);
+            else {
+                this.app.addLog("Import check request for session "+session.sessionId+" failed ("+reason+"); the session-manager will pick it up on its next scan", "warn");
             }
-            console.log('Error config:', error.config);
-        });
+        }
     }
 
     async getPhpSession(request) {

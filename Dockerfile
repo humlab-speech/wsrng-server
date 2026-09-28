@@ -28,12 +28,15 @@ COPY --from=dependencies /app/node_modules ./node_modules
 COPY package*.json ./
 COPY src ./src
 
-# Create logs directory with correct ownership
+# Create the logs directory and hand the app tree to the runtime `node` user
+# (uid 1000 / gid 1000). The deployment quadlet pins this uid to the host
+# repository owner with rootless --userns=keep-id:uid=1000,gid=1000, so the audio
+# wsrng-server writes under /repositories lands owned by that single host identity
+# — shared with session-manager, emu-webapp-server and apache. node must own its
+# own logs/ because the quadlet drops all capabilities (no DAC_OVERRIDE).
 RUN mkdir -p logs && \
     touch logs/wsrng-server.log && \
     chown -R node:node /wsrng-server
 
-# Run as node user for security
 USER node
-
 CMD ["node", "src/main.js"]

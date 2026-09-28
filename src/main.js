@@ -9,7 +9,13 @@ import { default as http } from "http";
 import { nanoid } from "nanoid";
 import { default as mongodb } from "mongodb";
 
-const version = "1.0.1";
+const version = "1.1.0";
+
+const SHUTDOWN_TIMEOUT_MS = 5000;
+
+// Item codes come from the URL and end up in filesystem paths, so only allow
+// the characters SPR script item codes actually use (e.g. "prompt_1").
+const ITEM_CODE_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
 
 class WebSpeechRecorderServer {
 	constructor() {
@@ -40,14 +46,43 @@ class WebSpeechRecorderServer {
 		});
 		
 		this.server = this.expressApp.listen(this.serverPort, () => {
-			process.on('SIGTERM', () => {
-				this.addLog('SIGTERM signal received: closing WebSpeechRecorderServer')
-				this.server.close(() => {
-					this.addLog('Shutdown');
-				});
-			});
 			this.addLog(`WebSpeechRecorderServer listening on port ${this.serverPort}`);
 		});
+
+		process.on('SIGTERM', () => this.shutdown('SIGTERM'));
+		process.on('SIGINT', () => this.shutdown('SIGINT'));
+	}
+
+	// server.close() alone never lets the process exit: it waits for idle
+	// keep-alive sockets, and the open Mongo connection keeps the event loop alive
+	// regardless. Podman then SIGKILLs us after its stop timeout and systemd marks
+	// the unit failed. So drop the sockets, close Mongo, and exit explicitly, with
+	// a hard deadline in case anything hangs.
+	shutdown(signal) {
+		if(this.shuttingDown) {
+			return;
+		}
+		this.shuttingDown = true;
+		this.addLog(signal+' signal received: closing WebSpeechRecorderServer');
+
+		setTimeout(() => {
+			this.addLog('Graceful shutdown timed out, forcing exit', 'warn');
+			process.exit(1);
+		}, SHUTDOWN_TIMEOUT_MS).unref();
+
+		this.server.close(async () => {
+			try {
+				await this.disconnectFromMongo();
+			}
+			catch(error) {
+				this.addLog('Error closing MongoDB connection: '+error, 'warn');
+			}
+			this.addLog('Shutdown');
+			process.exit(0);
+		});
+		this.server.closeIdleConnections();
+		// In-flight uploads get a moment to finish before being cut off.
+		setTimeout(() => this.server.closeAllConnections(), 2000).unref();
 	}
 
 	importHandlerModules() {
@@ -145,6 +180,29 @@ class WebSpeechRecorderServer {
 			}
 		});
 
+		//Audio of an already recorded take, fetched by the SPR client when it shows a
+		//prompt that was recorded in an earlier page load. Only the latest take of a
+		//prompt is kept, so that is what's served whatever version is asked for.
+		//Handler modules may move uploads elsewhere, so they get the first say in
+		//where the file lives.
+		this.expressApp.get("/project/:projectName/session/:sessionId/recfile/:itemCode/:version", async (req, res) => {
+			if(!ITEM_CODE_PATTERN.test(req.params.itemCode)) {
+				res.status(400).end();
+				return;
+			}
+			let session = await this.getSession(req.params.sessionId);
+			if(!session) {
+				res.status(404).end();
+				return;
+			}
+			let filePath = this.resolveRecfilePath(session, req.params.itemCode);
+			if(!filePath) {
+				res.status(404).end();
+				return;
+			}
+			res.sendFile(path.resolve(filePath), { headers: { "Content-Type": "audio/wav" } });
+		});
+
 		this.expressApp.get("/project/:projectName/resources/images/:imageFile", async (req, res) => {
 			try {
 				let image = this.readFile("resources/"+req.params.projectName+"/images/"+req.params.imageFile, false);
@@ -163,7 +221,16 @@ class WebSpeechRecorderServer {
 			let fileSequence = 0;
 			let itemCode = req.params.itemCode;
 			let fileEnding = "wav";
+			if(!ITEM_CODE_PATTERN.test(itemCode)) {
+				this.addLog("Rejected upload with invalid item code", "warn");
+				res.status(400).end();
+				return;
+			}
 			let session = await this.getSession(req.params.sessionId);
+			if(!session) {
+				res.status(404).end();
+				return;
+			}
 
 			let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/Data/speech_recorder_uploads/emudb-sessions/"+req.params.sessionId+"/"+itemCode;
 			//let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/Data/unimported_audio/emudb-sessions/"+req.params.sessionId+"/"+itemCode;
@@ -336,7 +403,9 @@ class WebSpeechRecorderServer {
 			return fs.readdirSync(recfileInputDirectoryPath);
 		}
 		catch(error) {
-			this.addLog(error, "error");
+			if(error.code != "ENOENT") {
+				this.addLog(error, "error");
+			}
 			return [];
 		}
 	}
@@ -405,12 +474,44 @@ class WebSpeechRecorderServer {
 	}
 
 	//What is called a "recfile" in the wsrng is really a list of objects describing recordings
+	//The SPR client uses this list to mark prompts recorded in an earlier page load
+	//as done; without it, a reloaded session can only be completed by re-recording
+	//every prompt. Recfiles are stored with "project"/"session" keys (see the upload
+	//endpoint). The client reads "version" to tell takes apart; recordingFileId
+	//can't serve, since it restarts at 0 whenever a handler module moves the
+	//uploads away, so takes are numbered per prompt in upload order.
 	async getRecfile(projectName, sessionId) {
-		const sessionsCollection = this.db.collection("recfiles");
-		return await sessionsCollection.find({
-			"projectName": projectName,
-			"sessionId": sessionId
-		}).toArray();
+		const recfilesCollection = this.db.collection("recfiles");
+		const recfiles = await recfilesCollection.find({
+			"project": projectName,
+			"session": sessionId
+		}).sort({ "date": 1 }).toArray();
+		const takesPerItem = {};
+		return recfiles.map(rf => {
+			const itemCode = rf.recording?.itemcode;
+			takesPerItem[itemCode] = (takesPerItem[itemCode] ?? -1) + 1;
+			return { ...rf, version: takesPerItem[itemCode] };
+		});
+	}
+
+	//Where the latest take of an item lives on disk, or null if it's gone.
+	resolveRecfilePath(session, itemCode) {
+		for(const module of this.handlerModules) {
+			if(typeof module.resolveRecfilePath == "function") {
+				const modulePath = module.resolveRecfilePath(session, itemCode);
+				if(modulePath) {
+					return modulePath;
+				}
+			}
+		}
+		const itemDir = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/Data/speech_recorder_uploads/emudb-sessions/"+session.sessionId+"/"+itemCode;
+		const takes = this.getRecfileVersionsList(itemDir)
+			.map(f => parseInt(f.split(".")[0]))
+			.filter(n => !isNaN(n));
+		if(takes.length == 0) {
+			return null;
+		}
+		return itemDir+"/"+Math.max(...takes)+".wav";
 	}
 
 	async getSession(sessionId) {
