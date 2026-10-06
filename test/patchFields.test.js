@@ -1,7 +1,7 @@
-// node --test src/patchFields.test.js  (no framework, like session-manager's pathSecurity.test.js)
+// node --test test/  (no framework, like session-manager's pathSecurity.test.js)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { allowedPatchFields } from "./patchFields.js";
+import { allowedPatchFields } from "../src/patchFields.js";
 
 test("the recorder's own progress report passes through untouched", () => {
     const body = { status: "COMPLETED", completedDate: "2026-10-05T10:00:00Z" };
