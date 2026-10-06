@@ -322,6 +322,7 @@ class WebSpeechRecorderServer {
 				});
 
 				session.status = "LOADED";
+				session.sealed = false; //a restarted session is not completed anymore; without this visp.js treats every later upload as a post-completion retake
 			}
 
 			if(typeof patchData.status != "undefined" && patchData.status == "COMPLETED") {
