@@ -13,6 +13,12 @@ import { default as fs } from "fs";
 // hasn't been imported yet, so a hint that never arrives just means a later import.
 const IMPORT_HINT_RETRY_DELAYS_MS = [2000, 10000, 30000];
 
+// How long to wait after a post-completion upload before hinting, so a burst
+// of retakes results in ONE import instead of one import per take. The
+// session-manager starts importing as soon as it receives a hint, so each hint
+// can delete and rebuild the session bundles.
+const IMPORT_HINT_SETTLE_MS = 5000;
+
 class VispHandler {
     constructor(app) {
         this.app = app;
@@ -29,7 +35,7 @@ class VispHandler {
                 // A re-take after completion (or the final upload, which the SPR
                 // client sends after COMPLETED) changes what should be imported.
                 if(data.session.sealed) {
-                    this.requestImportCheck(data.session);
+                    this.scheduleImportCheck(data.session);
                 }
                 break;
         }
@@ -83,6 +89,18 @@ class VispHandler {
     // Tell the session-manager to check this session for audio that needs
     // importing. It decides when the uploads have settled, so this can be sent
     // before the final file lands.
+    // Coalesce bursts of post-completion uploads into a single import hint.
+    scheduleImportCheck(session) {
+        this.pendingImportChecks ??= new Map();
+        if(this.pendingImportChecks.has(session.sessionId)) {
+            return;
+        }
+        this.pendingImportChecks.set(session.sessionId, setTimeout(() => {
+            this.pendingImportChecks.delete(session.sessionId);
+            this.requestImportCheck(session);
+        }, IMPORT_HINT_SETTLE_MS));
+    }
+
     async requestImportCheck(session, attempt = 0) {
         const postData = {
             projectId: session.project,
