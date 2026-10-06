@@ -7,6 +7,16 @@
 import axios from "axios";
 import { default as fs } from "fs";
 
+// Service base URLs for the VISP integration. The defaults are exactly
+// the host:port this module hardcoded before, because the live quadlet
+// (quadlets/{dev,prod}/wsrng-server.container) builds its environment
+// solely from external/wsrng-server/.env and no deployment sets these
+// vars yet - behaviour is unchanged until someone opts in. Read at
+// module load: main.js runs dotenv.config() before importing handler
+// modules, so .env values are already in process.env here.
+const SESSION_MANAGER_URL = process.env.SESSION_MANAGER_URL ?? "http://session-manager:8080";
+const APACHE_URL = process.env.APACHE_URL ?? "http://apache";
+
 // How often, and how far apart, to retry telling the session-manager that a
 // session needs an import check. The hint only speeds things up: the
 // session-manager also polls upload directories and imports anything that
@@ -107,7 +117,7 @@ class VispHandler {
             sessionId: session.sessionId
         };
         try {
-            await axios.post("http://session-manager:8080/api/importaudiofiles", postData, {
+            await axios.post(SESSION_MANAGER_URL+"/api/importaudiofiles", postData, {
                 headers: { 'Content-Type': 'application/json' },
                 timeout: 10000
             });
@@ -137,7 +147,7 @@ class VispHandler {
         }
 
         return new Promise((resolve, reject) => {
-            http.get("http://apache/api/api.php?f=session", options, (incMsg) => {
+            http.get(APACHE_URL+"/api/api.php?f=session", options, (incMsg) => {
                 let body = "";
                 incMsg.on('data', (data) => {
                     body += data;
