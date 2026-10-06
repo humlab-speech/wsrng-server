@@ -89,6 +89,21 @@ class WebSpeechRecorderServer {
 		setTimeout(() => this.server.closeAllConnections(), 2000).unref();
 	}
 
+	// express 4 does not await async handlers: a rejected promise inside one
+	// becomes an unhandled rejection, which on node >=20 terminates the process.
+	// Every async route handler goes through this so any future throw is a
+	// logged 500 instead of a dead recorder for everyone.
+	asyncHandler(handler) {
+		return (req, res) => {
+			Promise.resolve(handler(req, res)).catch(error => {
+				this.addLog("Unhandled error in "+req.method+" "+req.path+": "+error, "error");
+				if(!res.headersSent) {
+					res.status(500).end();
+				}
+			});
+		};
+	}
+
 	importHandlerModules() {
 		//Import any handler modules
 		const handlerDir = path.join('./src', 'handler_modules');
@@ -120,7 +135,7 @@ class WebSpeechRecorderServer {
 			next();
 		});
 		
-		this.expressApp.get("/session/:sessionId", async (req, res) => {
+		this.expressApp.get("/session/:sessionId", this.asyncHandler(async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
 
 			if(!session) {
@@ -144,9 +159,9 @@ class WebSpeechRecorderServer {
 				res.status(404);
 				res.end();
 			}
-		});
+		}));
 
-		this.expressApp.post("/session/new", async (req, res) => {
+		this.expressApp.post("/session/new", this.asyncHandler(async (req, res) => {
 			let sprSessionConfig = req.body;
 			//Both of these fields are later concatenated into filesystem paths, so
 			//refuse anything that is not a plain id before it is ever stored.
@@ -158,9 +173,9 @@ class WebSpeechRecorderServer {
 			}
 			let session = await this.createSession(sprSessionConfig);
 			res.end(JSON.stringify(session, null, 2));
-		});
+		}));
 
-		this.expressApp.get("/project/:projectName", async (req, res) => {
+		this.expressApp.get("/project/:projectName", this.asyncHandler(async (req, res) => {
 			let project = await this.getProject(req.params.projectName);
 			if(project) {
 				res.end(JSON.stringify(project, null, 2));
@@ -169,9 +184,9 @@ class WebSpeechRecorderServer {
 				res.status(404);
 				res.end();
 			}
-		});
+		}));
 
-		this.expressApp.get("/script/:scriptId", async (req, res) => {
+		this.expressApp.get("/script/:scriptId", this.asyncHandler(async (req, res) => {
 			let script = await this.getScript(req.params.scriptId);
 			if(script) {
 				res.end(JSON.stringify(script, null, 2));
@@ -180,9 +195,9 @@ class WebSpeechRecorderServer {
 				res.status(404);
 				res.end();
 			}
-		});
+		}));
 
-		this.expressApp.get("/project/:projectName/session/:sessionId/recfile", async (req, res) => {
+		this.expressApp.get("/project/:projectName/session/:sessionId/recfile", this.asyncHandler(async (req, res) => {
 			let recfile = await this.getRecfile(req.params.projectName, req.params.sessionId);
 			if(recfile) {
 				res.end(JSON.stringify(recfile, null, 2));
@@ -190,14 +205,14 @@ class WebSpeechRecorderServer {
 			else {
 				res.status(404).end();
 			}
-		});
+		}));
 
 		//Audio of an already recorded take, fetched by the SPR client when it shows a
 		//prompt that was recorded in an earlier page load. Only the latest take of a
 		//prompt is kept, so that is what's served whatever version is asked for.
 		//Handler modules may move uploads elsewhere, so they get the first say in
 		//where the file lives.
-		this.expressApp.get("/project/:projectName/session/:sessionId/recfile/:itemCode/:version", async (req, res) => {
+		this.expressApp.get("/project/:projectName/session/:sessionId/recfile/:itemCode/:version", this.asyncHandler(async (req, res) => {
 			if(!ITEM_CODE_PATTERN.test(req.params.itemCode)) {
 				res.status(400).end();
 				return;
@@ -218,7 +233,7 @@ class WebSpeechRecorderServer {
 				return;
 			}
 			res.sendFile(path.resolve(filePath), { headers: { "Content-Type": "audio/wav" } });
-		});
+		}));
 
 		this.expressApp.get("/project/:projectName/resources/images/:imageFile", async (req, res) => {
 			try {
@@ -231,7 +246,7 @@ class WebSpeechRecorderServer {
 		});
 
 		//This is an upload of a recorded wav
-		this.expressApp.post("/session/:sessionId/recfile/:itemCode", async (req, res) => {
+		this.expressApp.post("/session/:sessionId/recfile/:itemCode", this.asyncHandler(async (req, res) => {
 			//this method needs to:
 			//1. store the wav provided in a file storage area
 			let audioBinary = req.body;
@@ -301,15 +316,29 @@ class WebSpeechRecorderServer {
 			});
 
 			res.end();
-		});
+		}));
 
-		this.expressApp.patch("/project/:projectName/session/:sessionId", async (req, res) => {
+		this.expressApp.patch("/project/:projectName/session/:sessionId", this.asyncHandler(async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
 			if(!session) {
 				res.status(404).end();
 				return;
 			}
 			let patchData = req.body;
+
+			//Mass-assignment guard: a patch must never rewrite the document key
+			//(_id) or the session identity (sessionId/project) - _id would make the
+			//later replaceOne reject on the real driver, and identity changes would
+			//re-key or hijack another session.
+			if(patchData != null && typeof patchData == "object") {
+				delete patchData._id;
+				if((typeof patchData.sessionId != "undefined" && String(patchData.sessionId) !== String(session.sessionId))
+					|| (typeof patchData.project != "undefined" && String(patchData.project) !== String(session.project))) {
+					this.addLog("Rejected session patch overwriting sessionId or project", "warn");
+					res.status(400).end();
+					return;
+				}
+			}
 
 			//status can be:
 			//CREATED
@@ -348,7 +377,7 @@ class WebSpeechRecorderServer {
 			});
 
 			res.end();
-		});
+		}));
 	}
 
 	async createSession(sprSessionConfig) {
