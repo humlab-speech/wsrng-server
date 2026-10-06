@@ -17,9 +17,42 @@ const SHUTDOWN_TIMEOUT_MS = 5000;
 // the characters SPR script item codes actually use (e.g. "prompt_1").
 const ITEM_CODE_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
 
-// Project ids and session ids are client supplied too, and they end up in
-// filesystem paths as well, so they get the same character gate.
-const ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+// Project ids, session ids and image file names are client supplied too and
+// end up in filesystem paths. Instead of a character whitelist (which broke
+// real session names: webclient's manage-sessions-dialog explicitly allows
+// spaces and sends sessionId=sessionName, and legacy project ids contain
+// dots), apply the deny policy session-manager uses in src/pathSecurity.js
+// safePathComponent() (fix branch, 0883e6f), mirrored verbatim so the two
+// services cannot diverge. The only addition is the length cap, which
+// session-manager enforces in its own forms; the HTTP API here needs it too.
+// Rejects empty, over-length, '/', '\\', NUL, '.'/'..' and any '..'
+// sequence; spaces, dots and unicode are allowed.
+const MAX_PATH_COMPONENT_LENGTH = 128;
+
+function safePathComponent(component, label) {
+	if (typeof component !== "string" || component.length === 0) {
+		throw new Error(`Path traversal blocked: ${label} must be a non-empty string`);
+	}
+	if (component.length > MAX_PATH_COMPONENT_LENGTH) {
+		throw new Error(`Path traversal blocked: ${label} exceeds ${MAX_PATH_COMPONENT_LENGTH} characters`);
+	}
+	if (/[/\\\0]/.test(component)) {
+		throw new Error(
+			`Path traversal blocked: ${label} contains path separator or null byte`,
+		);
+	}
+	if (component === ".." || component === ".") {
+		throw new Error(
+			`Path traversal blocked: ${label} is a relative directory reference`,
+		);
+	}
+	if (component.includes("..")) {
+		throw new Error(
+			`Path traversal blocked: ${label} contains '..' sequence`,
+		);
+	}
+	return component;
+}
 
 class WebSpeechRecorderServer {
 	constructor() {
@@ -164,10 +197,17 @@ class WebSpeechRecorderServer {
 		this.expressApp.post("/session/new", this.asyncHandler(async (req, res) => {
 			let sprSessionConfig = req.body;
 			//Both of these fields are later concatenated into filesystem paths, so
-			//refuse anything that is not a plain id before it is ever stored.
-			if((typeof sprSessionConfig.project != "undefined" && !ID_PATTERN.test(String(sprSessionConfig.project)))
-				|| (typeof sprSessionConfig.sessionId != "undefined" && !ID_PATTERN.test(String(sprSessionConfig.sessionId)))) {
-				this.addLog("Rejected session config with an invalid project or sessionId", "warn");
+			//refuse path-unsafe values before they are ever stored.
+			try {
+				if(typeof sprSessionConfig.project != "undefined") {
+					safePathComponent(String(sprSessionConfig.project), "project");
+				}
+				if(typeof sprSessionConfig.sessionId != "undefined") {
+					safePathComponent(String(sprSessionConfig.sessionId), "sessionId");
+				}
+			}
+			catch(error) {
+				this.addLog("Rejected session config: "+error.message, "warn");
 				res.status(400).end();
 				return;
 			}
@@ -222,8 +262,12 @@ class WebSpeechRecorderServer {
 				res.status(404).end();
 				return;
 			}
-			if(!ID_PATTERN.test(String(session.sessionId)) || !ID_PATTERN.test(String(session.project))) {
-				this.addLog("Rejected recfile read for session with an invalid project or sessionId", "warn");
+			try {
+				safePathComponent(String(session.sessionId), "sessionId");
+				safePathComponent(String(session.project), "project");
+			}
+			catch(error) {
+				this.addLog("Rejected recfile read: "+error.message, "warn");
 				res.status(400).end();
 				return;
 			}
@@ -237,6 +281,10 @@ class WebSpeechRecorderServer {
 
 		this.expressApp.get("/project/:projectName/resources/images/:imageFile", async (req, res) => {
 			try {
+				//Both URL params reach readFile, and express decodes %2f into '/'
+				//inside req.params, so the deny check must run on the decoded value.
+				safePathComponent(req.params.projectName, "projectName");
+				safePathComponent(req.params.imageFile, "imageFile");
 				let image = this.readFile("resources/"+req.params.projectName+"/images/"+req.params.imageFile, false);
 				res.end(image);
 			}
@@ -258,13 +306,30 @@ class WebSpeechRecorderServer {
 				res.status(400).end();
 				return;
 			}
+			//Checked before the lookup so a traversing id is a 400 and can never
+			//reach the sinks below, whatever is stored in Mongo.
+			try {
+				safePathComponent(req.params.sessionId, "sessionId");
+			}
+			catch(error) {
+				this.addLog("Rejected upload: "+error.message, "warn");
+				res.status(400).end();
+				return;
+			}
 			let session = await this.getSession(req.params.sessionId);
 			if(!session) {
 				res.status(404).end();
 				return;
 			}
-			if(!ID_PATTERN.test(String(req.params.sessionId)) || !ID_PATTERN.test(String(session.project))) {
-				this.addLog("Rejected upload with an invalid session or project id", "warn");
+			//The document's own identity fields can predate this gate (legacy docs,
+			//admin session-id edits in the webclient), so they are validated again
+			//here, at the sink.
+			try {
+				safePathComponent(String(session.sessionId), "sessionId");
+				safePathComponent(String(session.project), "project");
+			}
+			catch(error) {
+				this.addLog("Rejected upload: "+error.message, "warn");
 				res.status(400).end();
 				return;
 			}
