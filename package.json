@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/main.js",
     "docker-start": "docker run -it --network visp_visp-net --name wsrng-server -v \"$(pwd):/app\"  --workdir /app node:lts node ./src/main.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test src/patchFields.test.js"
   },
   "author": "",
   "license": "ISC",

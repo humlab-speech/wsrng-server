@@ -8,6 +8,7 @@ import cookieParser from "cookie-parser";
 import { default as http } from "http";
 import { nanoid } from "nanoid";
 import { default as mongodb } from "mongodb";
+import { allowedPatchFields } from "./patchFields.js";
 
 const version = "1.1.0";
 
@@ -383,13 +384,24 @@ class WebSpeechRecorderServer {
 			res.end();
 		}));
 
-		this.expressApp.patch("/project/:projectName/session/:sessionId", this.asyncHandler(async (req, res) => {
+			this.expressApp.patch("/project/:projectName/session/:sessionId", this.asyncHandler(async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
 			if(!session) {
 				res.status(404).end();
 				return;
 			}
 			let patchData = req.body;
+			//Mass-assignment guard. This route has no authentication of its own - the
+			//recorder link is opened by participants who never log in - so the body is not
+			//trusted to name fields at all. Only the progress fields the recorder actually
+			//sends may be written; anything else is dropped and logged rather than answered
+			//with 400, because a future recorder release that adds a field must not lose its
+			//status update to a hard failure.
+			//"script" in particular must never be settable here: item codes name the recorded
+			//takes and every script numbers its prompts from prompt_1, so re-pointing a
+			//session that already holds recordings at another script makes the next
+			//participant record over takes belonging to other prompts - the very reason
+			//session-manager refuses that move on a project save.
 
 			//Mass-assignment guard: a patch must never rewrite the document key
 			//(_id) or the session identity (sessionId/project) - _id would make the
@@ -404,6 +416,10 @@ class WebSpeechRecorderServer {
 					return;
 				}
 			}
+
+			patchData = allowedPatchFields(patchData, (field) => {
+				this.addLog('Dropped non-patchable field "' + field + '" from a session patch', "warn");
+			});
 
 			//status can be:
 			//CREATED
