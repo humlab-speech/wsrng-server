@@ -126,10 +126,21 @@ class WebSpeechRecorderServer {
 	// express 4 does not await async handlers: a rejected promise inside one
 	// becomes an unhandled rejection, which on node >=20 terminates the process.
 	// Every async route handler goes through this so any future throw is a
-	// logged 500 instead of a dead recorder for everyone.
+	// logged 500 instead of a dead recorder for everyone. Rejections from
+	// safePathComponent (messages starting "Path traversal blocked:") are the
+	// expected ones: the routes call it directly and it becomes a logged 400
+	// with an empty body, exactly what the per-route try/catch blocks did.
 	asyncHandler(handler) {
 		return (req, res) => {
-			Promise.resolve(handler(req, res)).catch(error => {
+			handler(req, res).catch(error => {
+				const message = error instanceof Error && typeof error.message == "string" ? error.message : "";
+				if(message.startsWith("Path traversal blocked:")) {
+					this.addLog("Rejected "+req.method+" "+req.path+": "+message, "warn");
+					if(!res.headersSent) {
+						res.status(400).end();
+					}
+					return;
+				}
 				this.addLog("Unhandled error in "+req.method+" "+req.path+": "+error, "error");
 				if(!res.headersSent) {
 					res.status(500).end();
@@ -198,19 +209,13 @@ class WebSpeechRecorderServer {
 		this.expressApp.post("/session/new", this.asyncHandler(async (req, res) => {
 			let sprSessionConfig = req.body;
 			//Both of these fields are later concatenated into filesystem paths, so
-			//refuse path-unsafe values before they are ever stored.
-			try {
-				if(typeof sprSessionConfig.project != "undefined") {
-					safePathComponent(String(sprSessionConfig.project), "project");
-				}
-				if(typeof sprSessionConfig.sessionId != "undefined") {
-					safePathComponent(String(sprSessionConfig.sessionId), "sessionId");
-				}
+			//refuse path-unsafe values before they are ever stored. A rejection is
+			//answered with a logged 400 by asyncHandler.
+			if(typeof sprSessionConfig.project != "undefined") {
+				safePathComponent(String(sprSessionConfig.project), "project");
 			}
-			catch(error) {
-				this.addLog("Rejected session config: "+error.message, "warn");
-				res.status(400).end();
-				return;
+			if(typeof sprSessionConfig.sessionId != "undefined") {
+				safePathComponent(String(sprSessionConfig.sessionId), "sessionId");
 			}
 			let session = await this.createSession(sprSessionConfig);
 			res.end(JSON.stringify(session, null, 2));
@@ -263,15 +268,10 @@ class WebSpeechRecorderServer {
 				res.status(404).end();
 				return;
 			}
-			try {
-				safePathComponent(String(session.sessionId), "sessionId");
-				safePathComponent(String(session.project), "project");
-			}
-			catch(error) {
-				this.addLog("Rejected recfile read: "+error.message, "warn");
-				res.status(400).end();
-				return;
-			}
+			//The document's identity fields can predate the create-time gate, so they
+			//are validated again at the sink; asyncHandler maps a rejection to 400.
+			safePathComponent(String(session.sessionId), "sessionId");
+			safePathComponent(String(session.project), "project");
 			let filePath = this.resolveRecfilePath(session, req.params.itemCode);
 			if(!filePath) {
 				res.status(404).end();
@@ -308,32 +308,19 @@ class WebSpeechRecorderServer {
 				return;
 			}
 			//Checked before the lookup so a traversing id is a 400 and can never
-			//reach the sinks below, whatever is stored in Mongo.
-			try {
-				safePathComponent(req.params.sessionId, "sessionId");
-			}
-			catch(error) {
-				this.addLog("Rejected upload: "+error.message, "warn");
-				res.status(400).end();
-				return;
-			}
+			//reach the sinks below, whatever is stored in Mongo; asyncHandler
+			//maps the rejection to a logged 400.
+			safePathComponent(req.params.sessionId, "sessionId");
 			let session = await this.getSession(req.params.sessionId);
 			if(!session) {
 				res.status(404).end();
 				return;
 			}
-			//The document's own identity fields can predate this gate (legacy docs,
-			//admin session-id edits in the webclient), so they are validated again
-			//here, at the sink.
-			try {
-				safePathComponent(String(session.sessionId), "sessionId");
-				safePathComponent(String(session.project), "project");
-			}
-			catch(error) {
-				this.addLog("Rejected upload: "+error.message, "warn");
-				res.status(400).end();
-				return;
-			}
+			//The document's project can predate this gate (legacy docs, admin
+			//edits in the webclient), so it is validated again here, at the sink.
+			//sessionId needs no second check: getSession() is an exact-match
+			//findOne, so it equals the req.params.sessionId validated above.
+			safePathComponent(String(session.project), "project");
 
 			let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/Data/speech_recorder_uploads/emudb-sessions/"+req.params.sessionId+"/"+itemCode;
 			//let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/Data/unimported_audio/emudb-sessions/"+req.params.sessionId+"/"+itemCode;

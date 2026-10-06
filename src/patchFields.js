@@ -12,14 +12,14 @@
  * "sealed", "_id", "sessionId" and "project" are absent for the same reason - they
  * are set by this server, not reported by the recorder.
  */
-export const PATCHABLE_FIELDS = ["status", "loadedDate", "startedDate", "completedDate", "restartedDate"];
+const PATCHABLE_FIELDS = ["status", "loadedDate", "startedDate", "completedDate", "restartedDate"];
 
 /**
  * Returns only the patchable entries of `body`; unrecognised ones are reported so a
  * future recorder version that sends something new shows up in the log instead of
  * being silently ignored forever.
  */
-export function allowedPatchFields(body, onDropped = () => {}) {
+export function allowedPatchFields(body, onDropped) {
 	if (body == null || typeof body != "object") {
 		return {};
 	}
