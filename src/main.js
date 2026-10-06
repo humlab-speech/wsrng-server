@@ -22,7 +22,7 @@ const ITEM_CODE_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
 // real session names: webclient's manage-sessions-dialog explicitly allows
 // spaces and sends sessionId=sessionName, and legacy project ids contain
 // dots), apply the deny policy session-manager uses in src/pathSecurity.js
-// safePathComponent() (fix branch, 0883e6f), mirrored verbatim so the two
+// safePathComponent(), mirrored verbatim so the two
 // services cannot diverge. The only addition is the length cap, which
 // session-manager enforces in its own forms; the HTTP API here needs it too.
 // Rejects empty, over-length, '/', '\\', NUL, '.'/'..' and any '..'
