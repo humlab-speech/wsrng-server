@@ -280,7 +280,7 @@ class WebSpeechRecorderServer {
 			res.sendFile(path.resolve(filePath), { headers: { "Content-Type": "audio/wav" } });
 		}));
 
-		this.expressApp.get("/project/:projectName/resources/images/:imageFile", async (req, res) => {
+		this.expressApp.get("/project/:projectName/resources/images/:imageFile", this.asyncHandler(async (req, res) => {
 			try {
 				//Both URL params reach readFile, and express decodes %2f into '/'
 				//inside req.params, so the deny check must run on the decoded value.
@@ -290,9 +290,12 @@ class WebSpeechRecorderServer {
 				res.end(image);
 			}
 			catch(error) {
+				//Kept as a body catch rather than relying on asyncHandler's 400:
+				//for script-referenced images a blocked or missing path must look
+				//identical to the client - 404, no existence signal either way.
 				res.status(404).end();
 			}
-		});
+		}));
 
 		//This is an upload of a recorded wav
 		this.expressApp.post("/session/:sessionId/recfile/:itemCode", this.asyncHandler(async (req, res) => {
