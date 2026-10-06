@@ -305,6 +305,10 @@ class WebSpeechRecorderServer {
 
 		this.expressApp.patch("/project/:projectName/session/:sessionId", async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
+			if(!session) {
+				res.status(404).end();
+				return;
+			}
 			let patchData = req.body;
 
 			//status can be:
@@ -348,6 +352,12 @@ class WebSpeechRecorderServer {
 	}
 
 	async createSession(sprSessionConfig) {
+		//The client must not pick the document key: a duplicate _id makes insertOne
+		//reject inside this async handler, and an unhandled rejection in a route
+		//handler takes the whole process down.
+		if(sprSessionConfig != null && typeof sprSessionConfig == "object") {
+			delete sprSessionConfig._id;
+		}
 		//Check if this project exists as an SPR-project, otherwise we need to create that first
 		let sprProjectConfig = await this.getProject(sprSessionConfig.project);
 			
