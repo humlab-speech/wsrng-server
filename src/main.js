@@ -17,6 +17,10 @@ const SHUTDOWN_TIMEOUT_MS = 5000;
 // the characters SPR script item codes actually use (e.g. "prompt_1").
 const ITEM_CODE_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
 
+// Project ids and session ids are client supplied too, and they end up in
+// filesystem paths as well, so they get the same character gate.
+const ID_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+
 class WebSpeechRecorderServer {
 	constructor() {
 		dotenv.config();
@@ -144,6 +148,14 @@ class WebSpeechRecorderServer {
 
 		this.expressApp.post("/session/new", async (req, res) => {
 			let sprSessionConfig = req.body;
+			//Both of these fields are later concatenated into filesystem paths, so
+			//refuse anything that is not a plain id before it is ever stored.
+			if((typeof sprSessionConfig.project != "undefined" && !ID_PATTERN.test(String(sprSessionConfig.project)))
+				|| (typeof sprSessionConfig.sessionId != "undefined" && !ID_PATTERN.test(String(sprSessionConfig.sessionId)))) {
+				this.addLog("Rejected session config with an invalid project or sessionId", "warn");
+				res.status(400).end();
+				return;
+			}
 			let session = await this.createSession(sprSessionConfig);
 			res.end(JSON.stringify(session, null, 2));
 		});
@@ -195,6 +207,11 @@ class WebSpeechRecorderServer {
 				res.status(404).end();
 				return;
 			}
+			if(!ID_PATTERN.test(String(session.sessionId)) || !ID_PATTERN.test(String(session.project))) {
+				this.addLog("Rejected recfile read for session with an invalid project or sessionId", "warn");
+				res.status(400).end();
+				return;
+			}
 			let filePath = this.resolveRecfilePath(session, req.params.itemCode);
 			if(!filePath) {
 				res.status(404).end();
@@ -229,6 +246,11 @@ class WebSpeechRecorderServer {
 			let session = await this.getSession(req.params.sessionId);
 			if(!session) {
 				res.status(404).end();
+				return;
+			}
+			if(!ID_PATTERN.test(String(req.params.sessionId)) || !ID_PATTERN.test(String(session.project))) {
+				this.addLog("Rejected upload with an invalid session or project id", "warn");
+				res.status(400).end();
 				return;
 			}
 
