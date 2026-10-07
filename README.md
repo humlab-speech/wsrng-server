@@ -8,10 +8,10 @@ This server is written in JavaScript and uses MongoDB as a backend. It also need
 
 ## Prerequisites
 
-1. Node.js 20 or newer with npm. The deployment image pins `node:20.20.2-alpine3.22`
-   (Node 20 is past upstream EOL; the image should move to an LTS — the code itself is ESM
-   (`"type": "module"`), uses modern syntax (`??=`) and `node --test`, so Node 16 and older
-   will not work.)
+1. Node.js 24 or newer with npm (`package.json` declares `engines: node >=24`). The
+   deployment image pins `node:24.16.0-alpine3.22`. The code itself is ESM
+   (`"type": "module"`), uses modern syntax (`??=`) and `node --test`, so older Node
+   versions will not work.
 
 1. `git clone https://github.com/humlab-speech/wsrng-server`
 1. `cd wsrng-server`
