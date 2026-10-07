@@ -8,6 +8,7 @@ import cookieParser from "cookie-parser";
 import { default as http } from "http";
 import { nanoid } from "nanoid";
 import { default as mongodb } from "mongodb";
+import { allowedPatchFields } from "./patchFields.js";
 
 const version = "1.1.0";
 
@@ -16,6 +17,43 @@ const SHUTDOWN_TIMEOUT_MS = 5000;
 // Item codes come from the URL and end up in filesystem paths, so only allow
 // the characters SPR script item codes actually use (e.g. "prompt_1").
 const ITEM_CODE_PATTERN = /^[A-Za-z0-9_-]{1,100}$/;
+
+// Project ids, session ids and image file names are client supplied too and
+// end up in filesystem paths. Instead of a character whitelist (which broke
+// real session names: webclient's manage-sessions-dialog explicitly allows
+// spaces and sends sessionId=sessionName, and legacy project ids contain
+// dots), apply the deny policy session-manager uses in src/pathSecurity.js
+// safePathComponent(), mirrored verbatim so the two
+// services cannot diverge. The only addition is the length cap, which
+// session-manager enforces in its own forms; the HTTP API here needs it too.
+// Rejects empty, over-length, '/', '\\', NUL, '.'/'..' and any '..'
+// sequence; spaces, dots and unicode are allowed.
+const MAX_PATH_COMPONENT_LENGTH = 128;
+
+function safePathComponent(component, label) {
+	if (typeof component !== "string" || component.length === 0) {
+		throw new Error(`Path traversal blocked: ${label} must be a non-empty string`);
+	}
+	if (component.length > MAX_PATH_COMPONENT_LENGTH) {
+		throw new Error(`Path traversal blocked: ${label} exceeds ${MAX_PATH_COMPONENT_LENGTH} characters`);
+	}
+	if (/[/\\\0]/.test(component)) {
+		throw new Error(
+			`Path traversal blocked: ${label} contains path separator or null byte`,
+		);
+	}
+	if (component === ".." || component === ".") {
+		throw new Error(
+			`Path traversal blocked: ${label} is a relative directory reference`,
+		);
+	}
+	if (component.includes("..")) {
+		throw new Error(
+			`Path traversal blocked: ${label} contains '..' sequence`,
+		);
+	}
+	return component;
+}
 
 class WebSpeechRecorderServer {
 	constructor() {
@@ -85,6 +123,32 @@ class WebSpeechRecorderServer {
 		setTimeout(() => this.server.closeAllConnections(), 2000).unref();
 	}
 
+	// express 4 does not await async handlers: a rejected promise inside one
+	// becomes an unhandled rejection, which on node >=20 terminates the process.
+	// Every async route handler goes through this so any future throw is a
+	// logged 500 instead of a dead recorder for everyone. Rejections from
+	// safePathComponent (messages starting "Path traversal blocked:") are the
+	// expected ones: the routes call it directly and it becomes a logged 400
+	// with an empty body, exactly what the per-route try/catch blocks did.
+	asyncHandler(handler) {
+		return (req, res) => {
+			handler(req, res).catch(error => {
+				const message = error instanceof Error && typeof error.message == "string" ? error.message : "";
+				if(message.startsWith("Path traversal blocked:")) {
+					this.addLog("Rejected "+req.method+" "+req.path+": "+message, "warn");
+					if(!res.headersSent) {
+						res.status(400).end();
+					}
+					return;
+				}
+				this.addLog("Unhandled error in "+req.method+" "+req.path+": "+error, "error");
+				if(!res.headersSent) {
+					res.status(500).end();
+				}
+			});
+		};
+	}
+
 	importHandlerModules() {
 		//Import any handler modules
 		const handlerDir = path.join('./src', 'handler_modules');
@@ -116,7 +180,7 @@ class WebSpeechRecorderServer {
 			next();
 		});
 		
-		this.expressApp.get("/session/:sessionId", async (req, res) => {
+		this.expressApp.get("/session/:sessionId", this.asyncHandler(async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
 
 			if(!session) {
@@ -140,15 +204,24 @@ class WebSpeechRecorderServer {
 				res.status(404);
 				res.end();
 			}
-		});
+		}));
 
-		this.expressApp.post("/session/new", async (req, res) => {
+		this.expressApp.post("/session/new", this.asyncHandler(async (req, res) => {
 			let sprSessionConfig = req.body;
+			//Both of these fields are later concatenated into filesystem paths, so
+			//refuse path-unsafe values before they are ever stored. A rejection is
+			//answered with a logged 400 by asyncHandler.
+			if(typeof sprSessionConfig.project != "undefined") {
+				safePathComponent(String(sprSessionConfig.project), "project");
+			}
+			if(typeof sprSessionConfig.sessionId != "undefined") {
+				safePathComponent(String(sprSessionConfig.sessionId), "sessionId");
+			}
 			let session = await this.createSession(sprSessionConfig);
 			res.end(JSON.stringify(session, null, 2));
-		});
+		}));
 
-		this.expressApp.get("/project/:projectName", async (req, res) => {
+		this.expressApp.get("/project/:projectName", this.asyncHandler(async (req, res) => {
 			let project = await this.getProject(req.params.projectName);
 			if(project) {
 				res.end(JSON.stringify(project, null, 2));
@@ -157,9 +230,9 @@ class WebSpeechRecorderServer {
 				res.status(404);
 				res.end();
 			}
-		});
+		}));
 
-		this.expressApp.get("/script/:scriptId", async (req, res) => {
+		this.expressApp.get("/script/:scriptId", this.asyncHandler(async (req, res) => {
 			let script = await this.getScript(req.params.scriptId);
 			if(script) {
 				res.end(JSON.stringify(script, null, 2));
@@ -168,9 +241,9 @@ class WebSpeechRecorderServer {
 				res.status(404);
 				res.end();
 			}
-		});
+		}));
 
-		this.expressApp.get("/project/:projectName/session/:sessionId/recfile", async (req, res) => {
+		this.expressApp.get("/project/:projectName/session/:sessionId/recfile", this.asyncHandler(async (req, res) => {
 			let recfile = await this.getRecfile(req.params.projectName, req.params.sessionId);
 			if(recfile) {
 				res.end(JSON.stringify(recfile, null, 2));
@@ -178,14 +251,14 @@ class WebSpeechRecorderServer {
 			else {
 				res.status(404).end();
 			}
-		});
+		}));
 
 		//Audio of an already recorded take, fetched by the SPR client when it shows a
 		//prompt that was recorded in an earlier page load. Only the latest take of a
 		//prompt is kept, so that is what's served whatever version is asked for.
 		//Handler modules may move uploads elsewhere, so they get the first say in
 		//where the file lives.
-		this.expressApp.get("/project/:projectName/session/:sessionId/recfile/:itemCode/:version", async (req, res) => {
+		this.expressApp.get("/project/:projectName/session/:sessionId/recfile/:itemCode/:version", this.asyncHandler(async (req, res) => {
 			if(!ITEM_CODE_PATTERN.test(req.params.itemCode)) {
 				res.status(400).end();
 				return;
@@ -195,26 +268,37 @@ class WebSpeechRecorderServer {
 				res.status(404).end();
 				return;
 			}
+			//The document's identity fields can predate the create-time gate, so they
+			//are validated again at the sink; asyncHandler maps a rejection to 400.
+			safePathComponent(String(session.sessionId), "sessionId");
+			safePathComponent(String(session.project), "project");
 			let filePath = this.resolveRecfilePath(session, req.params.itemCode);
 			if(!filePath) {
 				res.status(404).end();
 				return;
 			}
 			res.sendFile(path.resolve(filePath), { headers: { "Content-Type": "audio/wav" } });
-		});
+		}));
 
-		this.expressApp.get("/project/:projectName/resources/images/:imageFile", async (req, res) => {
+		this.expressApp.get("/project/:projectName/resources/images/:imageFile", this.asyncHandler(async (req, res) => {
 			try {
+				//Both URL params reach readFile, and express decodes %2f into '/'
+				//inside req.params, so the deny check must run on the decoded value.
+				safePathComponent(req.params.projectName, "projectName");
+				safePathComponent(req.params.imageFile, "imageFile");
 				let image = this.readFile("resources/"+req.params.projectName+"/images/"+req.params.imageFile, false);
 				res.end(image);
 			}
 			catch(error) {
+				//Kept as a body catch rather than relying on asyncHandler's 400:
+				//for script-referenced images a blocked or missing path must look
+				//identical to the client - 404, no existence signal either way.
 				res.status(404).end();
 			}
-		});
+		}));
 
 		//This is an upload of a recorded wav
-		this.expressApp.post("/session/:sessionId/recfile/:itemCode", async (req, res) => {
+		this.expressApp.post("/session/:sessionId/recfile/:itemCode", this.asyncHandler(async (req, res) => {
 			//this method needs to:
 			//1. store the wav provided in a file storage area
 			let audioBinary = req.body;
@@ -226,11 +310,20 @@ class WebSpeechRecorderServer {
 				res.status(400).end();
 				return;
 			}
+			//Checked before the lookup so a traversing id is a 400 and can never
+			//reach the sinks below, whatever is stored in Mongo; asyncHandler
+			//maps the rejection to a logged 400.
+			safePathComponent(req.params.sessionId, "sessionId");
 			let session = await this.getSession(req.params.sessionId);
 			if(!session) {
 				res.status(404).end();
 				return;
 			}
+			//The document's project can predate this gate (legacy docs, admin
+			//edits in the webclient), so it is validated again here, at the sink.
+			//sessionId needs no second check: getSession() is an exact-match
+			//findOne, so it equals the req.params.sessionId validated above.
+			safePathComponent(String(session.project), "project");
 
 			let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/Data/speech_recorder_uploads/emudb-sessions/"+req.params.sessionId+"/"+itemCode;
 			//let filePath = process.env.AUDIO_FILE_STORAGE_PATH+"/"+session.project+"/Data/unimported_audio/emudb-sessions/"+req.params.sessionId+"/"+itemCode;
@@ -279,11 +372,44 @@ class WebSpeechRecorderServer {
 			});
 
 			res.end();
-		});
+		}));
 
-		this.expressApp.patch("/project/:projectName/session/:sessionId", async (req, res) => {
+			this.expressApp.patch("/project/:projectName/session/:sessionId", this.asyncHandler(async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
+			if(!session) {
+				res.status(404).end();
+				return;
+			}
 			let patchData = req.body;
+			//Mass-assignment guard. This route has no authentication of its own - the
+			//recorder link is opened by participants who never log in - so the body is not
+			//trusted to name fields at all. Only the progress fields the recorder actually
+			//sends may be written; anything else is dropped and logged rather than answered
+			//with 400, because a future recorder release that adds a field must not lose its
+			//status update to a hard failure.
+			//"script" in particular must never be settable here: item codes name the recorded
+			//takes and every script numbers its prompts from prompt_1, so re-pointing a
+			//session that already holds recordings at another script makes the next
+			//participant record over takes belonging to other prompts - the very reason
+			//session-manager refuses that move on a project save.
+
+			//Mass-assignment guard: a patch must never rewrite the document key
+			//(_id) or the session identity (sessionId/project) - _id would make the
+			//later replaceOne reject on the real driver, and identity changes would
+			//re-key or hijack another session.
+			if(patchData != null && typeof patchData == "object") {
+				delete patchData._id;
+				if((typeof patchData.sessionId != "undefined" && String(patchData.sessionId) !== String(session.sessionId))
+					|| (typeof patchData.project != "undefined" && String(patchData.project) !== String(session.project))) {
+					this.addLog("Rejected session patch overwriting sessionId or project", "warn");
+					res.status(400).end();
+					return;
+				}
+			}
+
+			patchData = allowedPatchFields(patchData, (field) => {
+				this.addLog('Dropped non-patchable field "' + field + '" from a session patch', "warn");
+			});
 
 			//status can be:
 			//CREATED
@@ -300,6 +426,7 @@ class WebSpeechRecorderServer {
 				});
 
 				session.status = "LOADED";
+				session.sealed = false; //a restarted session is not completed anymore; without this visp.js treats every later upload as a post-completion retake
 			}
 
 			if(typeof patchData.status != "undefined" && patchData.status == "COMPLETED") {
@@ -321,10 +448,16 @@ class WebSpeechRecorderServer {
 			});
 
 			res.end();
-		});
+		}));
 	}
 
 	async createSession(sprSessionConfig) {
+		//The client must not pick the document key: a duplicate _id makes insertOne
+		//reject inside this async handler, and an unhandled rejection in a route
+		//handler takes the whole process down.
+		if(sprSessionConfig != null && typeof sprSessionConfig == "object") {
+			delete sprSessionConfig._id;
+		}
 		//Check if this project exists as an SPR-project, otherwise we need to create that first
 		let sprProjectConfig = await this.getProject(sprSessionConfig.project);
 			
