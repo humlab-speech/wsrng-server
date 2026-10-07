@@ -93,8 +93,8 @@ enable it by adding "visp" to the `ENABLED_MODULES` array in the .env file.
 
 # Tests
 
-`npm test` currently runs exactly one file (`node --test src/patchFields.test.js`) — a newly
-added test file must be added to the script (or the script widened) to be picked up.
+`npm test` runs `node --test test/*.test.js` — a new test file named `*.test.js` under `test/` is
+picked up automatically.
 
 # Known issues
 
