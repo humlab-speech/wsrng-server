@@ -4,7 +4,7 @@
 # ============================================================================
 # Stage 1: Dependencies
 # ============================================================================
-FROM node:20.20.2-alpine3.22 AS dependencies
+FROM node:24.16.0-alpine3.22 AS dependencies
 
 WORKDIR /app
 
@@ -12,12 +12,12 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci --only=production
+RUN npm ci --omit=dev
 
 # ============================================================================
 # Stage 2: Runtime
 # ============================================================================
-FROM node:20.20.2-alpine3.22
+FROM node:24.16.0-alpine3.22
 
 WORKDIR /wsrng-server
 
