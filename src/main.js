@@ -211,25 +211,28 @@ class WebSpeechRecorderServer {
 			//Both of these fields are later concatenated into filesystem paths, so
 			//refuse path-unsafe values before they are ever stored. A rejection is
 			//answered with a logged 400 by asyncHandler.
+			//No String() coercion here: the raw body value is what gets stored, so
+			//validating the coerced text (e.g. {"$ne":null} -> "[object Object]")
+			//would let numbers, arrays and Mongo operator objects into documents
+			//that later exact-match lookups can never find. safePathComponent
+			//rejects anything that is not a non-empty string with the same 400.
 			if(typeof sprSessionConfig.project != "undefined") {
-				safePathComponent(String(sprSessionConfig.project), "project");
+				safePathComponent(sprSessionConfig.project, "project");
 			}
 			if(typeof sprSessionConfig.sessionId != "undefined") {
-				safePathComponent(String(sprSessionConfig.sessionId), "sessionId");
+				safePathComponent(sprSessionConfig.sessionId, "sessionId");
 			}
 			let session = await this.createSession(sprSessionConfig);
 			res.end(JSON.stringify(session, null, 2));
 		}));
 
 		this.expressApp.get("/project/:projectName", this.asyncHandler(async (req, res) => {
-			let project = await this.getProject(req.params.projectName);
-			if(project) {
-				res.end(JSON.stringify(project, null, 2));
-			}
-			else {
-				res.status(404);
-				res.end();
-			}
+			//An unknown name still gets the default document, as before, so the
+			//recorder's project fetch (which has no error branch) sees the shape it
+			//expects - but the answer is computed, not inserted.
+			let project = await this.getProject(req.params.projectName)
+				|| this.defaultProjectConfig(req.params.projectName);
+			res.end(JSON.stringify(project, null, 2));
 		}));
 
 		this.expressApp.get("/script/:scriptId", this.asyncHandler(async (req, res) => {
@@ -449,6 +452,35 @@ class WebSpeechRecorderServer {
 
 			res.end();
 		}));
+
+		//Terminal error handler. Without it, errors thrown before/around the
+		//routes (malformed JSON and oversized bodies from body-parser, anything
+		//reaching res after headers were sent) fall through to the Express
+		//default handler, which answers with an HTML page containing a full
+		//stack trace and absolute server paths. Answer like the rest of this
+		//service does: log server-side, send JSON without a stack to the client.
+		this.expressApp.use((error, req, res, next) => {
+			const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600 ? error.status : 500;
+			this.addLog("Request failed "+req.method+" "+req.path+": "+(error.message || error), status >= 500 ? "error" : "warn");
+			//ponytail: this arm is unreachable today (asyncHandler catches every route
+			//error and answers an empty 500 before anything reaches here). Kept at
+			//four lines because the failure it prevents - a half-written response that
+			//no one closes - is worse than the dead branch.
+			if(res.headersSent) {
+				//Hand it on rather than swallowing it: a handler that returns with the
+				//response half-written leaves the client waiting on a socket nobody
+				//will close. Express's own finalizer tears it down.
+				next(error);
+				return;
+			}
+			//4xx messages are this service's own or body-parser's ("entity.parse.failed"),
+			//safe to show. 5xx messages are library text and can carry absolute paths -
+			//the thing this handler exists to stop leaking - so the client gets a
+			//status and the log gets the detail.
+			res.status(status).json({
+				error: status < 500 ? (error.message || "Request failed") : "Request failed"
+			});
+		});
 	}
 
 	async createSession(sprSessionConfig) {
@@ -463,7 +495,12 @@ class WebSpeechRecorderServer {
 			
 		if(!sprProjectConfig) {
 			this.addLog("Will create new SPR project");
-			sprProjectConfig = this.createProject({
+			//This call used to be unawaited, which assigned a Promise: the
+			//sprProjectConfig.name below became undefined and the session was stored
+			//with no project. Nothing showed because getProject never returned a miss
+			//(it inserted a document on every call), so the branch below was dead.
+			//With the read honest, this is the only thing that provisions a project.
+			sprProjectConfig = await this.createProject({
 				name: sprSessionConfig.project
 			});
 		}
@@ -554,26 +591,33 @@ class WebSpeechRecorderServer {
         return list;
     }
 
+	//The one place a project document's defaults are spelled out. The read path
+	//uses it to answer a GET about an unknown project without writing anything;
+	//createProject uses it to fill what the caller left out. (There were two
+	//divergent copies of these literals before.)
+	defaultProjectConfig(projectName) {
+		return {
+			name: projectName,
+			description: 'No description',
+			audioFormat: {
+				channels: 1
+			},
+			speakerWindowShowStopRecordAction: true,
+			recordingDeviceWakeLock: true
+		};
+	}
+
+	//Read-only on purpose: an HTTP GET must not be able to create state. The
+	//lookup used to compare the stored name (a string) against parseInt(name),
+	//which is NaN for every real name, so it never matched and the "create it if
+	//missing" branch below ran on every request - 31 projects documents on the
+	//test box, from an endpoint the /spr Location publishes with no Require at
+	//all. Provisioning belongs to createSession, the only entry point with a
+	//reason to create a project.
 	async getProject(sprProjectName) {
-		let project = await this.db.collection("projects").findOne({
-			"name": parseInt(sprProjectName)
+		return await this.db.collection("projects").findOne({
+			"name": sprProjectName
 		});
-
-		if(!project) {
-			project = {
-				name: sprProjectName,
-				description: 'No description',
-				audioFormat: {
-					channels: 1
-				},
-				speakerWindowShowStopRecordAction: true,
-				recordingDeviceWakeLock: true
-			};
-
-			await this.db.collection("projects").insertOne(project)
-		}
-
-		return project;
 	}
 
 	async createRecfile(recFileConfig) {
@@ -583,22 +627,12 @@ class WebSpeechRecorderServer {
 	}
 
 	async createProject(projectConfig) {
-		let projectJsonDefaults = {
-			"description": "No description",
-			"name": "Noname",
-			"audioFormat" : {
-				"channels": 1
-			},
-			"speakerWindowShowStopRecordAction": true,
-			"recordingDeviceWakeLock": true
-		};
-
+		let projectJsonDefaults = this.defaultProjectConfig(projectConfig.name);
 		Object.keys(projectJsonDefaults).forEach(k => {
 			if(typeof projectConfig[k] == "undefined") {
 				projectConfig[k] = projectJsonDefaults[k];
 			}
 		});
-
 		await this.db.collection("projects").insertOne(projectConfig);
 
 		this.invokeHandlerModules("createProject", projectConfig);

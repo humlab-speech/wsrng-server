@@ -54,7 +54,7 @@ are exactly nine routes:
 | `GET` | `/script/:scriptId` | Fetch a recording script (`findOne` on the `scripts` collection — no validation; scripts are created out-of-band) |
 | `POST` | `/session/new` | Create a recording session (project + session id validated, see security rules) |
 | `GET` | `/session/:sessionId` | Fetch a session record by session id |
-| `GET` | `/project/:projectName` | Fetch project config — **auto-inserts** a default project document when none matches (see known issue below) |
+| `GET` | `/project/:projectName` | Fetch project config — read-only: an unknown name is answered with the defaults, nothing is written (a project is created by `POST /session/new`) |
 | `GET` | `/project/:projectName/session/:sessionId/recfile` | List recorded takes (recfiles are stored under `project`/`session` keys) |
 | `GET` | `/project/:projectName/session/:sessionId/recfile/:itemCode/:version` | Fetch a take's audio; `:version` `latest` selects the newest take |
 | `POST` | `/session/:sessionId/recfile/:itemCode` | Upload a recorded wav take |
@@ -65,6 +65,8 @@ are exactly nine routes:
 
 - **Project / session ids** follow a deny policy: rejected only if empty, longer than 128
   chars, containing `/`, `\`, NUL, `..`, or equal to `.`/`..`. Spaces and unicode are allowed.
+  In the `POST /session/new` body they must additionally be strings — numbers, arrays, `null`
+  and query-operator objects like `{"$ne":null}` are rejected with 400, never stored.
 - **Item codes** follow a strict whitelist: `[A-Za-z0-9_-]{1,100}`.
 - **`PATCH` on a session** only accepts progress fields
   (`status`, `loadedDate`, `startedDate`, `completedDate`, `restartedDate`). All other
@@ -94,13 +96,16 @@ enable it by adding "visp" to the `ENABLED_MODULES` array in the .env file.
 # Tests
 
 `npm test` runs `node --test test/*.test.js` — a new test file named `*.test.js` under `test/` is
-picked up automatically.
+picked up automatically. `test/http.test.js` starts the real server with the MongoDB driver
+replaced by an in-memory stub (`test/helpers/mongo-stub.mjs`), so no database is needed.
+Without a local Node 24 the whole suite runs in the deployment image:
+
+```
+podman run --rm -v "$PWD:/app" -w /app docker.io/library/node:24.16.0-alpine3.22 \
+  sh -c 'npm install --no-audit --silent && node --test "test/*.test.js"'
+```
 
 # Known issues
 
-- `GET /project/:name` **auto-inserts** a default project document when the lookup misses,
-  and the lookup compares `parseInt(name)` against documents stored with `name` as a
-  *string* — so numeric-named projects re-insert on every GET. Left unfixed deliberately
-  (upstream behavior); do not rely on GET /project being side-effect free.
 - `npm run docker-start` references the pre-quadlet `visp_visp-net` compose network and is
   stale in the Podman deployment; use the deployment repo's `visp.py` instead.
