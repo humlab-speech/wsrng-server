@@ -377,7 +377,7 @@ class WebSpeechRecorderServer {
 			res.end();
 		}));
 
-			this.expressApp.patch("/project/:projectName/session/:sessionId", this.asyncHandler(async (req, res) => {
+		this.expressApp.patch("/project/:projectName/session/:sessionId", this.asyncHandler(async (req, res) => {
 			let session = await this.getSession(req.params.sessionId);
 			if(!session) {
 				res.status(404).end();
@@ -462,7 +462,7 @@ class WebSpeechRecorderServer {
 		this.expressApp.use((error, req, res, next) => {
 			const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600 ? error.status : 500;
 			this.addLog("Request failed "+req.method+" "+req.path+": "+(error.message || error), status >= 500 ? "error" : "warn");
-			//ponytail: this arm is unreachable today (asyncHandler catches every route
+			//Note: this arm is unreachable today (asyncHandler catches every route
 			//error and answers an empty 500 before anything reaches here). Kept at
 			//four lines because the failure it prevents - a half-written response that
 			//no one closes - is worse than the dead branch.
@@ -473,12 +473,16 @@ class WebSpeechRecorderServer {
 				next(error);
 				return;
 			}
-			//4xx messages are this service's own or body-parser's ("entity.parse.failed"),
-			//safe to show. 5xx messages are library text and can carry absolute paths -
-			//the thing this handler exists to stop leaking - so the client gets a
-			//status and the log gets the detail.
+			//Messages that explicitly say expose=false are never shown. Other 4xx
+			//messages are this service's own or body-parser's
+			//("entity.parse.failed"), safe to show. 5xx messages are library text
+			//and can carry absolute paths - the thing this handler exists to stop
+			//leaking - so the client gets a status and the log gets the detail.
+			const clientMessage = status < 500 && error.expose !== false
+				? (error.message || "Request failed")
+				: "Request failed";
 			res.status(status).json({
-				error: status < 500 ? (error.message || "Request failed") : "Request failed"
+				error: clientMessage
 			});
 		});
 	}
