@@ -4,7 +4,7 @@
 # ============================================================================
 # Stage 1: Dependencies
 # ============================================================================
-FROM node:24.16.0-alpine3.22 AS dependencies
+FROM docker.io/library/node:24.22.2-alpine3.24 AS dependencies
 
 WORKDIR /app
 
@@ -17,7 +17,12 @@ RUN npm ci --omit=dev
 # ============================================================================
 # Stage 2: Runtime
 # ============================================================================
-FROM node:24.16.0-alpine3.22
+FROM docker.io/library/node:24.22.2-alpine3.24
+
+# Patch the Alpine packages past the tag's build date, and drop npm and yarn:
+# the service runs plain node, and their bundled node_modules are only attack
+# surface (and scanner findings).
+RUN apk upgrade --no-cache &&     rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx            /opt/yarn-* /usr/local/bin/yarn /usr/local/bin/yarnpkg
 
 WORKDIR /wsrng-server
 
